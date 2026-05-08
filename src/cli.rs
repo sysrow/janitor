@@ -29,10 +29,6 @@ pub struct Cli {
     #[arg(short = 'j', long, global = true)]
     pub json: bool,
 
-    /// Suppress non-essential output.
-    #[arg(short = 'q', long, global = true)]
-    pub quiet: bool,
-
     #[command(subcommand)]
     pub command: Command,
 }
@@ -786,7 +782,7 @@ sudo janitor acl grant /srv/shared -u bob -rwx -d -R\n\n  \
 janitor who-can /etc/shadow\n\n  \
 # Presets (private, group-shared, setgid-dir, ...). List with `janitor presets`.\n  \
 sudo janitor preset group-shared /srv/team -R\n\nSHORT FLAGS\n  \
--n dry-run   -j json   -q quiet\n  \
+-n dry-run   -j json\n  \
 -u user      -g group  -a access-string    -r read  -w write  -x exec\n  \
 -R recursive           -L max-level        -d default (acl)\n  \
 -A has-acl / capture-acl / acl-marker\n  \

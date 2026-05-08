@@ -104,7 +104,7 @@ fn run(cli: Cli) -> errors::Result<()> {
             recursive,
             force_all_parents,
             capture_acl,
-            exclude: _exclude,
+            exclude,
         } => {
             let access = crate::cli::resolve_access(read, write, exec, access.as_deref());
             commands::cmd_grant(
@@ -116,6 +116,7 @@ fn run(cli: Cli) -> errors::Result<()> {
                 recursive,
                 force_all_parents,
                 capture_acl,
+                &exclude,
                 dry_run,
             )
         }

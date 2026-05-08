@@ -20,7 +20,7 @@ pub fn ensure_backup_root() -> std::io::Result<PathBuf> {
     let root = backup_root();
     fs::create_dir_all(&root)?;
     // Harden backup directory: 0700 (owner only) to prevent backup injection.
-    let md = fs::metadata(&root)?;
+    let md = fs::symlink_metadata(&root)?;
     let mode = md.permissions().mode() & 0o777;
     if mode != 0o700 {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;

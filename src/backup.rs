@@ -25,7 +25,7 @@ pub fn save_backup(entries: Vec<SnapEntry>, operation: Operation) -> Result<Stri
     let path = root.join(format!("{bid}.{EXT}"));
     let payload = Backup {
         id: bid.clone(),
-        timestamp: ts.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        timestamp: ts.to_rfc3339(),
         operation,
         entries,
     };
@@ -33,6 +33,10 @@ pub fn save_backup(entries: Vec<SnapEntry>, operation: Operation) -> Result<Stri
     let mut writer = BufWriter::new(file);
     rmp_serde::encode::write_named(&mut writer, &payload)
         .map_err(|e| PmError::Other(format!("msgpack write: {e}")))?;
+    let file = writer
+        .into_inner()
+        .map_err(|e| PmError::Other(format!("flush: {e}")))?;
+    file.sync_all()?;
     Ok(bid)
 }
 

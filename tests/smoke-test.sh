@@ -89,8 +89,6 @@ assert_grep "version is semver"      "$VER_OUT" '^janitor [0-9][0-9]*\.[0-9][0-9
 HLP=$($JAN --help 2>&1)
 assert_grep "help advertises -n"     "$HLP" '\-n, \-\-dry-run'
 assert_grep "help advertises -j"     "$HLP" '\-j, \-\-json'
-assert_grep "help advertises -q"     "$HLP" '\-q, \-\-quiet'
-
 GHLP=$($JAN grant --help 2>&1)
 assert_grep "grant -u documented"    "$GHLP" '\-u, \-\-user'
 assert_grep "grant -a documented"    "$GHLP" '\-a, \-\-access'
@@ -711,11 +709,6 @@ ID_J=$(echo "$EXS" | jq -r '.id' 2>/dev/null)
 if [[ "$ID_J" == "$B_EX" ]]; then pass "export -j has id field"; else fail "export -j id $ID_J"; fi
 ENT=$(echo "$EXS" | jq -r '.entries | length' 2>/dev/null)
 if [[ -n "$ENT" && "$ENT" -ge 1 ]]; then pass "export -j has entries"; else fail "export -j entries $ENT"; fi
-
-# ── 48. -q quiet flag ──────────────────────────────────────────────
-Q_OUT=$($JAN -q preset list 2>&1)
-# Quiet doesn't suppress data, just chatter; presets should still list
-assert_grep "quiet does not break data" "$Q_OUT" "private"
 
 # ── 49. grant --force-all-parents ──────────────────────────────────
 chmod 755 "$ROOT"  # world-readable parent

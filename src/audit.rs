@@ -63,12 +63,12 @@ pub fn scan(
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
+            if exclude.is_excluded(e.path()) {
+                return false;
+            }
             if include_pseudo {
                 return true;
             }
-            // Only test directory boundaries; testing every file would
-            // dominate walk time. statfs at a mount point is enough to
-            // prune the entire subtree.
             if e.file_type().is_dir() && crate::helpers::is_pseudo_fs(e.path()) {
                 pseudo_skipped += 1;
                 return false;
@@ -77,9 +77,6 @@ pub fn scan(
         });
     for entry in walker.filter_map(|e| e.ok()) {
         let p = entry.path();
-        if exclude.is_excluded(p) {
-            continue;
-        }
         let md = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
