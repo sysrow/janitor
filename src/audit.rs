@@ -59,6 +59,7 @@ pub fn scan(
 ) -> (Vec<AuditHit>, usize) {
     let mut hits: Vec<AuditHit> = Vec::new();
     let mut pseudo_skipped = 0usize;
+    let root_dev = std::fs::symlink_metadata(path).map(|m| m.dev()).unwrap_or(0);
     let walker = walkdir::WalkDir::new(path)
         .follow_links(false)
         .into_iter()
@@ -69,9 +70,13 @@ pub fn scan(
             if include_pseudo {
                 return true;
             }
-            if e.file_type().is_dir() && crate::helpers::is_pseudo_fs(e.path()) {
-                pseudo_skipped += 1;
-                return false;
+            if e.file_type().is_dir() {
+                if let Ok(md) = e.metadata() {
+                    if md.dev() != root_dev && crate::helpers::is_pseudo_fs(e.path()) {
+                        pseudo_skipped += 1;
+                        return false;
+                    }
+                }
             }
             true
         });
@@ -407,6 +412,7 @@ pub fn cmd_find_orphans(path: &str, as_json: bool, include_pseudo: bool) -> Resu
     let t0 = Instant::now();
     let mut hits: Vec<(AuditHit, &'static str)> = Vec::new();
     let mut pseudo_skipped = 0usize;
+    let root_dev = std::fs::symlink_metadata(&root).map(|m| m.dev()).unwrap_or(0);
     let walker = walkdir::WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
@@ -414,9 +420,13 @@ pub fn cmd_find_orphans(path: &str, as_json: bool, include_pseudo: bool) -> Resu
             if include_pseudo {
                 return true;
             }
-            if e.file_type().is_dir() && crate::helpers::is_pseudo_fs(e.path()) {
-                pseudo_skipped += 1;
-                return false;
+            if e.file_type().is_dir() {
+                if let Ok(md) = e.metadata() {
+                    if md.dev() != root_dev && crate::helpers::is_pseudo_fs(e.path()) {
+                        pseudo_skipped += 1;
+                        return false;
+                    }
+                }
             }
             true
         });
