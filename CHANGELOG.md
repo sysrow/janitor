@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-08
+
+Correctness and safety pass: symlink handling, setuid/setgid restore order,
+exclude subtree pruning, backup durability, and documentation sync.
+
+### Fixed
+- **Symlink safety (seal, chown, chmod, copy-perms):** all ownership changes
+  now use `lchown(2)` semantics — symlinks are never followed. `seal`
+  baseline skips `chmod` on symlinks (whose mode bits are meaningless on
+  Linux). `config::ensure_backup_root` uses `symlink_metadata` to avoid
+  TOCTOU via symlink-to-directory swap.
+- **Setuid/setgid restore order (perms):** `apply_restore` now calls `chown`
+  before `chmod`, because `chown(2)` clears S_ISUID and S_ISGID. The old
+  order silently dropped setuid/setgid bits on restore. Additionally uses
+  raw `libc::chmod` instead of `fs::set_permissions` to preserve bits above
+  0o777.
+- **Exclude subtree pruning (grant, chmod, chown, seal, audit, copy-perms):**
+  `--exclude` now prunes entire directory subtrees via `WalkDir::filter_entry`,
+  not just individual entries. Previously `--exclude logs` excluded the
+  `logs/` directory itself but still descended into `logs/archive/old.log`.
+- **Grant -R double backup:** recursive grant created two backups (one for
+  parents, one for target+descendants). Consolidated into a single backup.
+- **Backup durability:** `.mpk` backup files are now flushed and `fsync`ed
+  before the mutation begins, preventing crash-induced backup loss.
+- **Backup timestamps:** now use RFC 3339 with timezone offset for correct
+  age parsing by `history --since`. Legacy offset-less timestamps are still
+  parsed for backward compatibility.
+- **list-backups order:** JSON output now matches TTY output (newest first).
+- **Lock bypass (seal, acl grant/revoke/strip):** `seal` and all `acl`
+  mutation subcommands now check path locks before proceeding. Recursive
+  walks also check locks on each descendant.
+- **NUL-byte path crash (perms):** `CString::new().unwrap()` replaced with
+  proper error handling — paths containing NUL bytes produce a diagnostic
+  instead of a panic.
+
+### Removed
+- **`--quiet` / `-q` global flag:** was defined in CLI but never wired to
+  any command. Removed from `cli.rs`, completions, smoke tests, and
+  documentation.
+
+### Documentation
+- Man page (`janitor.1`): removed stale `--quiet` flag and `find` subcommand
+  references. Added `seal`, `--since` for history, and `man` sections. Updated
+  command overview table with all subcommands added since v0.1.0.
+- README: removed `--quiet` from global flags line.
+
 ## [0.1.2] - 2026-04-23
 
 UX polish pass driven by `tmp/demo.sh` review: tighter alignment, more

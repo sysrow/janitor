@@ -188,7 +188,7 @@ single-letter equivalent.
 | `attr show\|set-immutable\|clear-immutable\|set-append-only\|clear-append-only PATH` | Wrapper around `chattr` / `lsattr`. |
 | `completions SHELL` | bash / zsh / fish / powershell / elvish. |
 
-**Global flags:** `-n, --dry-run`, `-j, --json` (where supported), `-q, --quiet`, `-h, --help`, `-V, --version`.
+**Global flags:** `-n, --dry-run`, `-j, --json` (where supported), `-h, --help`, `-V, --version`.
 
 See `man janitor` (or `janitor(1)`) for the full manual with workflows and more examples.
 
