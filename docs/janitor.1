@@ -43,10 +43,6 @@ Print what would be done without touching the filesystem. Safe to run as root.
 Emit machine-readable JSON where the subcommand supports it
 .RB ( audit ", " find-orphans ", " who-can ", " diff ", " export ", " list-backups ).
 .TP
-.BR \-q ", " \-\-quiet
-Suppress non-essential output. Data output is preserved; only progress /
-advisory lines are silenced.
-.TP
 .BR \-h ", " \-\-help
 Show help and exit.
 .TP
@@ -75,9 +71,16 @@ audit (a)	Scan a tree for suspicious / matching permissions
 find-orphans	Files whose UID / GID is not in /etc/passwd /group
 who-can (w)	Reverse query: which users can read / write / exec a path
 acl	POSIX ACL management (\fBgrant\fR|\fBrevoke\fR|\fBshow\fR|\fBstrip\fR)
-preset (p)	Apply a named preset (\fBprivate\fR, \fBgroup-shared\fR, ...)
-presets	List all presets with modes
+preset (p)	Named presets (\fBpreset list\fR, \fBpreset apply NAME PATH\fR)
+seal	Lock down a tree to a uniform baseline with surgical pinholes
+explain (e)	Human-readable read/write/exec verdict for a path
+compare	Side-by-side diff of two paths (or two trees with \fB\-R\fR)
+lock / unlock / locks	Per-path mutation guard (prevent accidental changes)
+policy	Declarative YAML policy (\fBapply\fR | \fBverify\fR)
+batch	Run many ops from a file under a single snapshot
+attr	Extended attributes / immutable flags (\fBchattr\fR wrapper)
 completions	Emit shell completion script
+man	Emit a roff man page to stdout
 .TE
 .SH COMMANDS
 .SS grant
@@ -462,10 +465,17 @@ Only entries whose GID is not in
 .SS history
 .B janitor history
 .I PATH
+.RB [ \-s
+.IR DUR ]
 .PP
 List every backup whose target path contains
 .IR PATH ,
 newest first. With
+.B \-\-since
+.I DUR
+only backups newer than DUR are shown (e.g.
+.BR 30m ", " 1h ", " 2d ", " 1w ).
+With
 .B \-\-json
 emits an array of
 .RI { id ", " timestamp ", " type ", " target ", " entries }
@@ -699,6 +709,11 @@ demands for private keys.
 .PP
 Emit a shell completion script for
 .IR bash ", " zsh ", " fish ", " powershell ", or " elvish .
+.SS man
+.B janitor man
+.PP
+Emit a roff man page to stdout. Useful for generating the installed man page
+at build or package time.
 .SH WORKFLOWS
 .SS Inspecting a single path
 One command for "what is going on with this file?":
@@ -1040,13 +1055,48 @@ the group is set to the managed group.
 Granting access to a world-readable target (o+r set) emits a warning,
 because in that state the grant is purely advisory: every user on the box
 could already read the file.
-.SS find
-.B janitor find
-.I PATH
-[\fB\-m\fR \fIOCTAL\fR] [\fB\-W\fR] [\fB\-r\fR] [\fB\-x\fR] [\fB\-s\fR] [\fB\-S\fR] [\fB\-t\fR] [\fB\-o\fR \fIUSER\fR] [\fB\-g\fR \fIGROUP\fR] [\fB\-A\fR] [\fB\-E\fR \fIGLOB\fR] [\fB\-0\fR]
+.SS seal
+.B janitor seal
+.I BASE
+.B \-B
+.I USER:GROUP:MODE
+.RB [ \-R ]
+.RB [ \-\-allow
+.IR USER:PERM
+.IR PATH ]
+.RB [ \-\-allow\-group
+.IR GROUP:PERM
+.IR PATH ]
+.RB [ \-E
+.IR GLOB ]
 .PP
-Read-only permission-aware search. Prints one path per line, or NUL-separated with
-\fB\-0\fR. Pipes cleanly into \fBjanitor chmod \-\-stdin0\fR.
+Seal a directory tree to a uniform baseline. The baseline
+.RB ( \-B )
+is applied via POSIX
+.BR chown (2)
++
+.BR chmod (2)
+only \- no ACLs are written unless
+.B \-\-allow
+or
+.B \-\-allow\-group
+pinholes are specified. This means a plain
+.B janitor seal DIR \-B root:root:700 \-R
+works on any filesystem, including FAT and tmpfs.
+.PP
+When pinholes are given, seal automatically adds
+.B u:USER:\-\-x
+(or
+.BR g:GROUP:\-\-x )
+ACL entries on every parent directory between BASE and each pinhole target,
+so the pinhole actually reaches the intended file. One snapshot covers the
+entire operation.
+.PP
+Without
+.B \-R
+only the base directory itself is adjusted. Pass
+.B \-E GLOB
+(repeatable) to skip matching paths.
 .SS explain
 .B janitor explain
 .I PATH
