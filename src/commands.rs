@@ -27,6 +27,7 @@ pub fn cmd_grant(
     recursive: bool,
     force_all_parents: bool,
     capture_acl: bool,
+    exclude: &[String],
     dry_run: bool,
 ) -> Result<()> {
     if user.is_none() && group.is_none() {
@@ -158,14 +159,24 @@ pub fn cmd_grant(
         }
     }
 
+    let ex = crate::matcher::ExcludeSet::new(exclude)?;
+
+    // Build full touched set: parents + target + recursive descendants.
     let mut touched: Vec<PathBuf> = filtered_parents.clone();
     touched.push(chain.last().unwrap().clone());
+    let extra: Vec<PathBuf> = if recursive && target.is_dir() {
+        collect_recursive(&target, &ex)
+    } else {
+        Vec::new()
+    };
+    let mut all_paths = touched.clone();
+    all_paths.extend(extra.iter().cloned());
 
     with_lock(|| {
-        // Save backup early.
+        // Single backup covering parents + target + recursive descendants.
         let mut backup_id: Option<String> = None;
         if !dry_run {
-            let snap = snapshot_with_acl(&touched, capture_acl);
+            let snap = snapshot_with_acl(&all_paths, capture_acl);
             let op = Operation {
                 op_type: "grant".into(),
                 user: user.map(String::from),
@@ -264,37 +275,16 @@ pub fn cmd_grant(
             );
         }
 
-        // Recursive branch (unchanged logic, lightweight narration).
-        if recursive && target.is_dir() {
-            let extra = collect_recursive(&target);
-            if !dry_run && !extra.is_empty() {
-                let snap2 = snapshot_with_acl(&extra, capture_acl);
-                if !snap2.is_empty() {
-                    let bid2 = save_backup(
-                        snap2,
-                        Operation {
-                            op_type: "grant-recursive-extra".into(),
-                            user: user.map(String::from),
-                            group: Some(group_name.clone()),
-                            explicit_group: group.map(String::from),
-                            target: Some(target.display().to_string()),
-                            access: Some(access.to_string()),
-                            max_level: None,
-                            recursive: Some(true),
-                            parent_op: None,
-                        },
-                    )?;
-                    if stdout_tty {
-                        println!(
-                            "  {} {}  {} {} {}",
-                            paint(Style::Ok, g.check),
-                            paint(Style::Label, "recursive    "),
-                            paint(Style::Primary, &extra.len().to_string()),
-                            paint(Style::Label, "entries (backup"),
-                            paint(Style::Primary, &format!("{bid2})"))
-                        );
-                    }
-                }
+        // Recursive descendants.
+        if !extra.is_empty() {
+            if stdout_tty {
+                println!(
+                    "  {} {}  {} {}",
+                    paint(Style::Ok, g.check),
+                    paint(Style::Label, "recursive         "),
+                    paint(Style::Primary, &extra.len().to_string()),
+                    paint(Style::Label, "entries")
+                );
             }
             extra
                 .par_iter()
@@ -380,11 +370,13 @@ fn narrate_action(tty: bool, dry_run: bool, already_ok: bool, verb: &str, subjec
 }
 
 /// Collect all entries under a directory (excluding root itself).
-fn collect_recursive(target: &Path) -> Vec<PathBuf> {
+/// Excluded directories are pruned: their children are never visited.
+fn collect_recursive(target: &Path, exclude: &crate::matcher::ExcludeSet) -> Vec<PathBuf> {
     walkdir::WalkDir::new(target)
         .min_depth(1)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|e| !exclude.is_excluded(e.path()))
         .filter_map(|e| e.ok())
         .map(|e| e.into_path())
         .collect()
@@ -408,7 +400,8 @@ pub fn cmd_backup(path: &str, recursive: bool, capture_acl: bool) -> Result<()> 
     let target = resolve_path(path)?;
     let mut paths = vec![target.clone()];
     if recursive && target.is_dir() {
-        paths.extend(collect_recursive(&target));
+        let empty = crate::matcher::ExcludeSet::new(&[])?;
+        paths.extend(collect_recursive(&target, &empty));
     }
     with_lock(|| {
         let snap = snapshot_with_acl(&paths, capture_acl);
@@ -631,12 +624,21 @@ fn format_op_split(op: &crate::types::Operation) -> (String, String) {
     (head, tgt)
 }
 
+fn parse_backup_ts(ts: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S")
+                .ok()
+                .map(|naive| naive.and_utc())
+        })
+}
+
 /// Returns something like "2h 14m ago" or "3d" etc.
 fn backup_age(ts: &str) -> String {
     let now = chrono::Utc::now();
-    let when = chrono::DateTime::parse_from_rfc3339(ts)
-        .map(|d| d.with_timezone(&chrono::Utc))
-        .unwrap_or(now);
+    let when = parse_backup_ts(ts).unwrap_or(now);
     let d = now.signed_duration_since(when);
     let secs = d.num_seconds().max(0);
     if secs < 60 {
@@ -654,10 +656,7 @@ fn backup_age(ts: &str) -> String {
 
 fn backup_age_hours(ts: &str) -> Option<i64> {
     let now = chrono::Utc::now();
-    chrono::DateTime::parse_from_rfc3339(ts).ok().map(|d| {
-        now.signed_duration_since(d.with_timezone(&chrono::Utc))
-            .num_hours()
-    })
+    parse_backup_ts(ts).map(|d| now.signed_duration_since(d).num_hours())
 }
 
 /// Parse `1h`, `30m`, `2d`, `1w`, `45s` into a `chrono::Duration`.
@@ -723,8 +722,8 @@ pub fn cmd_history(path: &str, since: Option<&str>, as_json: bool) -> Result<()>
                 continue;
             }
             if let Some(cut) = cutoff {
-                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&b.timestamp) {
-                    if ts.with_timezone(&chrono::Utc) < cut {
+                if let Some(ts) = parse_backup_ts(&b.timestamp) {
+                    if ts < cut {
                         continue;
                     }
                 }
@@ -929,6 +928,7 @@ pub fn cmd_list_backups(as_json: bool, path_substr: Option<&str>) -> Result<()> 
                 }));
             }
         }
+        rows.reverse(); // newest first
         println!(
             "{}",
             serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
@@ -990,6 +990,7 @@ pub fn cmd_list_backups(as_json: bool, path_substr: Option<&str>) -> Result<()> 
             }
         }
     }
+    rows.reverse(); // newest first
     if !stdout_tty {
         for r in &rows {
             println!("{}", r.0);

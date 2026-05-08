@@ -37,12 +37,11 @@ pub fn expand_targets(
                 .min_depth(1)
                 .follow_links(false)
                 .into_iter()
+                .filter_entry(|e| !exclude.is_excluded(e.path()))
                 .filter_map(|e| e.ok())
             {
                 let ep = entry.into_path();
-                if exclude.is_excluded(&ep) {
-                    continue;
-                }
+                crate::locks::ensure_not_locked(&ep)?;
                 paths.push(ep);
             }
         }
@@ -612,6 +611,7 @@ pub fn cmd_copy_perms(
     }
 
     // Collect targets (dst + optionally children), honoring --exclude.
+    // Check locks on every expanded descendant, not just the root.
     let mut targets: Vec<std::path::PathBuf> = Vec::new();
     if !exclude.is_excluded(&dst_path) {
         targets.push(dst_path.clone());
@@ -621,12 +621,11 @@ pub fn cmd_copy_perms(
             .follow_links(false)
             .min_depth(1)
             .into_iter()
+            .filter_entry(|e| !exclude.is_excluded(e.path()))
             .filter_map(|e| e.ok())
         {
             let ep = entry.path().to_path_buf();
-            if exclude.is_excluded(&ep) {
-                continue;
-            }
+            crate::locks::ensure_not_locked(&ep)?;
             targets.push(ep);
         }
     }
@@ -697,12 +696,19 @@ pub fn cmd_copy_perms(
             return Ok(());
         }
 
-        // Apply mode + ownership.
+        // Apply ownership first, then mode (so chown's setuid/setgid
+        // clear is overwritten by the subsequent chmod).
         let mut changed = 0usize;
         for t in &targets {
             let tmd = fs::symlink_metadata(t).map_err(|e| PmError::InsufficientPrivileges {
                 path: t.clone(),
                 reason: e.to_string(),
+            })?;
+            lchown(t, Some(src_uid), Some(src_gid)).map_err(|e| {
+                PmError::InsufficientPrivileges {
+                    path: t.clone(),
+                    reason: e.to_string(),
+                }
             })?;
             if !tmd.file_type().is_symlink() {
                 fs::set_permissions(t, fs::Permissions::from_mode(src_mode)).map_err(|e| {
@@ -712,12 +718,6 @@ pub fn cmd_copy_perms(
                     }
                 })?;
             }
-            lchown(t, Some(src_uid), Some(src_gid)).map_err(|e| {
-                PmError::InsufficientPrivileges {
-                    path: t.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
             changed += 1;
         }
 

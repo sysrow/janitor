@@ -145,6 +145,7 @@ pub fn cmd_seal(
     dry_run: bool,
 ) -> Result<()> {
     let base_path = resolve_path(base)?;
+    crate::locks::ensure_not_locked(&base_path)?;
     if !base_path.is_dir() {
         return Err(PmError::SealBaseNotDir(base_path));
     }
@@ -189,18 +190,17 @@ pub fn cmd_seal(
         return Err(PmError::AclUnsupported { path: base_path });
     }
 
-    // --- collect baseline targets (walk) ---
+    // --- collect baseline targets (walk), checking locks on each ---
     let mut baseline_paths: Vec<PathBuf> = Vec::new();
     if recursive {
         for entry in walkdir::WalkDir::new(&base_path)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|e| !ex.is_excluded(e.path()))
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
-            if ex.is_excluded(p) {
-                continue;
-            }
+            crate::locks::ensure_not_locked(p)?;
             baseline_paths.push(p.to_path_buf());
         }
     } else {
@@ -285,7 +285,7 @@ pub fn cmd_seal(
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn apply_baseline(paths: &[PathBuf], spec: &BaseSpec) -> Result<()> {
-    use nix::unistd::{chown, Gid, Uid};
+    use nix::unistd::{Gid, Uid};
     let uid = match &spec.user {
         Some(u) => Some(Uid::from_raw(
             nix::unistd::User::from_name(u)
@@ -310,17 +310,40 @@ fn apply_baseline(paths: &[PathBuf], spec: &BaseSpec) -> Result<()> {
     };
 
     for p in paths {
-        // chown first. Uid/Gid options: None means "unchanged".
-        if uid.is_some() || gid.is_some() {
-            chown(p, uid, gid)
-                .map_err(|e| PmError::Other(format!("chown {}: {e}", p.display())))?;
-        }
-        // chmod: mask special bits for non-dir if they weren't in the
-        // spec (keep behavior deterministic).
         let md = std::fs::symlink_metadata(p)?;
         if md.file_type().is_symlink() {
-            // Skip chmod on symlinks — mode is irrelevant.
+            // Symlinks: lchown only (never follow), skip chmod.
+            if uid.is_some() || gid.is_some() {
+                let u = uid.map(|u| u.as_raw()).unwrap_or(u32::MAX);
+                let g = gid.map(|g| g.as_raw()).unwrap_or(u32::MAX);
+                let c_path = std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
+                    .map_err(|_| PmError::Other(format!("bad path: {}", p.display())))?;
+                let ret = unsafe { libc::lchown(c_path.as_ptr(), u, g) };
+                if ret != 0 {
+                    return Err(PmError::Other(format!(
+                        "lchown {}: {}",
+                        p.display(),
+                        std::io::Error::last_os_error()
+                    )));
+                }
+            }
             continue;
+        }
+        // Non-symlink: chown first, then chmod (so chown's setuid/setgid
+        // clear is overwritten by the subsequent chmod).
+        if uid.is_some() || gid.is_some() {
+            let u = uid.map(|u| u.as_raw()).unwrap_or(u32::MAX);
+            let g = gid.map(|g| g.as_raw()).unwrap_or(u32::MAX);
+            let c_path = std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
+                .map_err(|_| PmError::Other(format!("bad path: {}", p.display())))?;
+            let ret = unsafe { libc::lchown(c_path.as_ptr(), u, g) };
+            if ret != 0 {
+                return Err(PmError::Other(format!(
+                    "lchown {}: {}",
+                    p.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
         }
         let mut mode = spec.mode;
         // Traditional "X" semantics: if spec mode has no x bits and

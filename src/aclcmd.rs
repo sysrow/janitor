@@ -24,6 +24,7 @@ pub fn cmd_acl_grant(
         return Err(PmError::NoUserOrGroup);
     }
     let target = resolve_path(path)?;
+    crate::locks::ensure_not_locked(&target)?;
     if !supports_acl(&target) {
         return Err(PmError::AclUnsupported { path: target });
     }
@@ -102,6 +103,7 @@ pub fn cmd_acl_revoke(
         return Err(PmError::NoUserOrGroup);
     }
     let target = resolve_path(path)?;
+    crate::locks::ensure_not_locked(&target)?;
     if !supports_acl(&target) {
         return Err(PmError::AclUnsupported { path: target });
     }
@@ -148,6 +150,7 @@ pub fn cmd_acl_revoke(
 /// `acl strip PATH [--recursive]`: remove all ACLs.
 pub fn cmd_acl_strip(path: &str, recursive: bool, dry_run: bool) -> Result<()> {
     let target = resolve_path(path)?;
+    crate::locks::ensure_not_locked(&target)?;
     if !supports_acl(&target) {
         return Err(PmError::AclUnsupported { path: target });
     }

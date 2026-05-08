@@ -17,8 +17,8 @@ use crate::errors::{PmError, Result};
 ///     `cp`, `ls`, `prune`, `i`, `a`, `w`, `p`, `e`) and the `-R` visible
 ///     short alias on `compare --recursive`,
 ///   * the `-h`/`--help` and `-V`/`--version` flags,
-///   * short forms of the global `-n`/`-j`/`-q` flags (long forms
-///     `--dry-run`/`--json`/`--quiet` remain in completion).
+///   * short forms of the global `-n`/`-j` flags (long forms
+///     `--dry-run`/`--json` remain in completion).
 ///
 /// The original `Cli::command()` used by the parser and by `cmd_man` is
 /// untouched, so `janitor g -n ...` still works and the man page still
@@ -41,7 +41,7 @@ fn hide_for_completion(mut cmd: Command) -> Command {
     cmd = cmd.mut_args(|a| {
         let a = a.visible_short_alias(None);
         match a.get_id().as_str() {
-            "dry_run" | "json" | "quiet" => a.short(None),
+            "dry_run" | "json" => a.short(None),
             _ => a,
         }
     });

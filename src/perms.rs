@@ -89,7 +89,14 @@ pub fn apply_restore(entries: &[SnapEntry], dry_run: bool) -> u32 {
                 // lchown: do NOT follow symlinks (unlike std::os::unix::fs::chown).
                 use std::ffi::CString;
                 use std::os::unix::ffi::OsStrExt;
-                let c_path = CString::new(p.as_os_str().as_bytes()).unwrap();
+                let c_path = match CString::new(p.as_os_str().as_bytes()) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        eprintln!("error: invalid path (NUL byte): {}", p.display());
+                        errors += 1;
+                        continue;
+                    }
+                };
                 let ret = unsafe { libc::lchown(c_path.as_ptr(), uid, gid) };
                 if ret != 0 {
                     let e = std::io::Error::last_os_error();
@@ -104,8 +111,22 @@ pub fn apply_restore(entries: &[SnapEntry], dry_run: bool) -> u32 {
             // Preview already shows diffs; don't emit raw command lines.
         } else {
             let set_perms = || -> std::io::Result<()> {
-                fs::set_permissions(p, fs::Permissions::from_mode(perm))?;
+                // Ownership first: chown clears setuid/setgid, so the
+                // subsequent chmod re-applies them correctly.
                 chown(p, Some(uid), Some(gid))?;
+                fs::set_permissions(p, fs::Permissions::from_mode(perm))?;
+                // Rust's set_permissions may drop bits above 0o777 on
+                // some versions; re-apply via raw libc::chmod.
+                if perm & 0o7000 != 0 {
+                    use std::ffi::CString;
+                    use std::os::unix::ffi::OsStrExt;
+                    let c_path = CString::new(p.as_os_str().as_bytes())
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                    let rc = unsafe { libc::chmod(c_path.as_ptr(), perm as libc::mode_t) };
+                    if rc != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 Ok(())
             };
             if let Err(e) = set_perms() {
