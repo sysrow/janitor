@@ -133,7 +133,7 @@ assert_grep "grant prints backup:"    "$OUT" "backup:"
 
 # ── 5. real grant (short flags) ─────────────────────────────────────
 chmod -R 700 "$ROOT"
-$JAN restore "$BID" > /dev/null 2>&1
+$JAN restore "$BID" --yes > /dev/null 2>&1
 OUT2=$($JAN grant "$ROOT/deep/dir/target.txt" -u "$USER" -a r 2>&1)
 BID2=$(echo "$OUT2" | awk '/^backup:/ {print $2}')
 if [[ -n "$BID2" ]]; then pass "grant short -u -a returns bid"; else fail "short grant no bid"; fi
@@ -159,7 +159,7 @@ if [[ "${TGT_PERM:1:1}" -ge 4 ]]; then pass "target group readable"; else fail "
 
 # ── 8. alias `g` (grant) + `ls` (list-backups) ──────────────────────
 chmod -R 700 "$ROOT"
-$JAN restore "$BID2" > /dev/null 2>&1
+$JAN restore "$BID2" --yes > /dev/null 2>&1
 OUT3=$($JAN g "$ROOT/deep/dir/target.txt" -u "$USER" -a r 2>&1)
 assert_grep "alias g == grant"        "$OUT3" "backup:"
 BID3=$(echo "$OUT3" | awk '/^backup:/ {print $2}')
