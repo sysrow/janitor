@@ -59,7 +59,9 @@ pub fn scan(
 ) -> (Vec<AuditHit>, usize) {
     let mut hits: Vec<AuditHit> = Vec::new();
     let mut pseudo_skipped = 0usize;
-    let root_dev = std::fs::symlink_metadata(path).map(|m| m.dev()).unwrap_or(0);
+    let root_dev = std::fs::symlink_metadata(path)
+        .map(|m| m.dev())
+        .unwrap_or(0);
     let walker = walkdir::WalkDir::new(path)
         .follow_links(false)
         .into_iter()
@@ -412,7 +414,9 @@ pub fn cmd_find_orphans(path: &str, as_json: bool, include_pseudo: bool) -> Resu
     let t0 = Instant::now();
     let mut hits: Vec<(AuditHit, &'static str)> = Vec::new();
     let mut pseudo_skipped = 0usize;
-    let root_dev = std::fs::symlink_metadata(&root).map(|m| m.dev()).unwrap_or(0);
+    let root_dev = std::fs::symlink_metadata(&root)
+        .map(|m| m.dev())
+        .unwrap_or(0);
     let walker = walkdir::WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
