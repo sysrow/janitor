@@ -179,7 +179,7 @@ single-letter equivalent.
 | `preset` (`p`) `apply NAME PATH... [-R] [-E GLOB]` | Apply a named mode (`private`, `group-shared`, `setgid-dir`, `ssh-key`, ...). Accepts many PATHs under one snapshot. |
 | `seal PATH -B USER:GROUP:MODE [-R] [--allow USER:PERM PATH] [--allow-group GROUP:PERM PATH] [-E GLOB]` | Atomic "uniform baseline + surgical pinholes". Baseline is POSIX-only (chown + chmod), ACLs are written only for the `--allow` pinholes and their parent-chain traversal bits. One snapshot covers everything. |
 | `list-backups` (`ls`) `[-p SUBSTR]` / `prune-backups` (`prune`) `[-k N]` | List (optionally filter by target path) / prune snapshots. |
-| `backup` (`b`) `PATH [-R] [-A]` | Snapshot without changing anything. |
+| `backup` (`b`) `PATH [-R] [--no-acl]` | Snapshot without changing anything (ACLs included by default). |
 | `explain` (`e`) `PATH [-U USER]` | Human-readable r/w/x verdict walking the parent chain. |
 | `compare A B [-R]` | Diff mode / owner / group / ACL. Exit 1 on drift. |
 | `lock PATH [-r REASON]` / `unlock PATH` / `locks` | Block all janitor mutations on PATH (and descendants if PATH is a directory). |
@@ -393,7 +393,7 @@ sudo janitor copy-perms /srv/template /srv/new -R -A                     # copy 
 
 ### Snapshots, history, undo, restore
 ```sh
-sudo janitor backup /srv/project -R -A          # create manual snapshot
+sudo janitor backup /srv/project -R              # create manual snapshot (ACLs included)
 sudo janitor list-backups                       # list snapshots (newest first)
 sudo janitor list-backups -p /srv/project       # list snapshots touching /srv/project
 sudo janitor history /srv/project               # show history for one path
