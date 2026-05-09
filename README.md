@@ -11,7 +11,7 @@ Hierarchical Unix filesystem permissions manager with snapshots, ACLs, and audit
 
 Safe defaults: `lchown(2)` is used for symlinks, an advisory file lock prevents concurrent mutations, `SIGINT` aborts cleanly with exit 130, and `--dry-run` prints every planned change without touching disk.
 
-No runtime dependencies beyond `glibc` and (for the `acl` subcommand) the `acl` package.
+No runtime dependencies beyond a Linux kernel and (for the `acl` subcommand) the `acl` package. A statically linked musl build runs on any Linux distribution from RHEL 8 to Fedora 43.
 
 ---
 
@@ -81,10 +81,22 @@ published for systems without a compatible glibc (Alpine, minimal containers).
 cargo install --path .
 ```
 
+### Static binary (recommended — runs everywhere)
+
+```sh
+VERSION=0.1.4
+curl -LO https://github.com/Tristram1337/janitor/releases/download/v${VERSION}/janitor-linux-amd64-static
+sudo install -m 0755 janitor-linux-amd64-static /usr/local/bin/janitor
+```
+
+The static (musl) binary has **no glibc requirement** and runs on every
+Linux x86_64 system from RHEL 8 / Ubuntu 22.04 to Fedora 43.
+
 ### Runtime dependencies
 
-- Linux with `glibc` >= 2.35 (Debian 12+, Ubuntu 22.04+, RHEL 9+, Arch, Fedora).
-  The static (musl) tarballs have no glibc requirement and run on Alpine, Debian 11, and minimal containers.
+- **glibc build:** requires glibc >= 2.39 (Debian 13+, Ubuntu 24.04+, Fedora 42+).
+  The `.deb` and `.rpm` packages use the glibc build.
+- **Static (musl) build:** no glibc requirement. Runs on any Linux x86_64 kernel >= 4.18 (RHEL 8+, Debian 12+, Ubuntu 22.04+).
 - `acl` package (for `janitor acl` subcommands): `apt install acl` or `dnf install acl`.
 - `shadow-utils` (`groupadd`, `gpasswd`) for the automatic managed-group feature of `grant`.
 - The Debian and RPM packages declare these as dependencies automatically.
@@ -473,7 +485,16 @@ Requirements: Rust 1.85 or newer, a GNU toolchain, `pkg-config`.
 git clone https://github.com/Tristram1337/janitor
 cd janitor
 cargo build --release
-# Binary at target/release/janitor (~1.2 MB stripped).
+# Binary at target/release/janitor (glibc, ~3.4 MB stripped).
+```
+
+For a fully static binary that runs on any Linux (RHEL 8+, Debian 12+, Ubuntu 22.04+, Alpine):
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+sudo apt install musl-tools   # or: dnf install musl-gcc
+cargo build --release --target x86_64-unknown-linux-musl
+# Binary at target/x86_64-unknown-linux-musl/release/janitor (~3.6 MB, static-pie).
 ```
 
 Reproducible release profile (configured in `Cargo.toml`):
@@ -489,19 +510,45 @@ codegen-units = 1
 
 ## Testing
 
-The test suite consists of unit tests and an end-to-end smoke test that runs inside Docker (Debian Trixie) and exercises every subcommand, every flag, and the revert path.
+The test suite consists of three layers:
 
 ```sh
-# Unit tests.
+# Unit tests (59 tests).
 cargo test --release
 
-# End-to-end smoke tests in Docker (260+ assertions).
+# End-to-end smoke tests in Docker (263 assertions).
 cargo build --release
 docker build -f tests/Dockerfile -t janitor-test .
 docker run --rm janitor-test
+
+# Cross-distro tests (138 assertions, requires root on target host).
+bash tests/cross-distro-test.sh
+
+# Multi-host orchestrator (deploys + runs on N hosts via SSH).
+bash tests/distro-test-orchestrator.sh
 ```
 
-CI runs both on every push via GitHub Actions (`.github/workflows/ci.yml`).
+CI runs unit + Docker smoke tests on every push.
+
+### Tested distributions
+
+The v0.1.4 release passes **4,400+ assertions across 11 distributions** with zero failures:
+
+| Distribution | Version | Kernel | Filesystem | SELinux | Smoke (263) | Cross-distro (138) |
+|---|---|---|---|---|---|---|
+| Rocky Linux | 8.8 | 4.18 | XFS | Enforcing | 263/0 | 138/0 |
+| Rocky Linux | 9.2 | 5.14 | XFS | Enforcing | 263/0 | 138/0 |
+| AlmaLinux | 8.10 | 4.18 | XFS | Enforcing | 263/0 | 138/0 |
+| AlmaLinux | 9.7 | 5.14 | XFS | Enforcing | 263/0 | 138/0 |
+| CentOS Stream | 9 | 5.14 | XFS | Enforcing | 263/0 | 138/0 |
+| Fedora | 42 | 6.14 | Btrfs | Enforcing | 262/0 | 138/0 |
+| Fedora | 43 | 6.17 | Btrfs | Enforcing | 262/0 | 138/0 |
+| Debian | 12 (bookworm) | 6.1 | ext4 | — | 263/0 | 138/0 |
+| Debian | 13 (trixie) | 6.12 | ext4 | — | 263/0 | 138/0 |
+| Ubuntu | 22.04 LTS | 5.15 | ext4 | — | 263/0 | 138/0 |
+| Ubuntu | 24.04 LTS | 6.8 | ext4 | — | 263/0 | 138/0 |
+
+Filesystems tested: **XFS, Btrfs, ext4**. SELinux enforcing on 7 of 11 hosts with zero AVC denials. Kernel range: 4.18 (RHEL 8) through 6.17 (Fedora 43). Static musl binary used on all hosts.
 
 ---
 
