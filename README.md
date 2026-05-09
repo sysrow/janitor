@@ -11,7 +11,7 @@ Hierarchical Unix filesystem permissions manager with snapshots, ACLs, and audit
 
 Safe defaults: `lchown(2)` is used for symlinks, an advisory file lock prevents concurrent mutations, `SIGINT` aborts cleanly with exit 130, and `--dry-run` prints every planned change without touching disk.
 
-No runtime dependencies beyond a Linux kernel and (for the `acl` subcommand) the `acl` package. A statically linked musl build runs on any Linux distribution from RHEL 8 to Fedora 43.
+No runtime dependencies beyond a Linux kernel and (for the `acl` subcommand) the `acl` package. A statically linked musl build runs on any Linux x86_64 distribution — tested on 12 distros from RHEL 8 (kernel 4.18, glibc 2.28) to Fedora 43 / Ubuntu 25.10 (kernel 6.17, glibc 2.42).
 
 ---
 
@@ -38,42 +38,61 @@ Every tagged release publishes prebuilt Debian, Red Hat, and portable tarball
 artifacts for `amd64` and `arm64`. Replace `VERSION` with the latest version
 from the [releases page](https://github.com/Tristram1337/janitor/releases).
 
-### Debian / Ubuntu
+### Static binary (recommended — runs everywhere)
 
 ```sh
-VERSION=0.1.0
-curl -LO https://github.com/Tristram1337/janitor/releases/download/v${VERSION}/janitor_${VERSION}-1_amd64.deb
-sudo apt install ./janitor_${VERSION}-1_amd64.deb
-```
-
-For `arm64` substitute `arm64` for `amd64`. The package installs the binary to
-`/usr/bin/janitor`, the man page to `/usr/share/man/man1/janitor.1`, and pulls
-in `acl` and `passwd` as dependencies.
-
-### Red Hat / Fedora / RHEL / Rocky / Alma
-
-```sh
-VERSION=0.1.0
-sudo dnf install https://github.com/Tristram1337/janitor/releases/download/v${VERSION}/janitor-${VERSION}-1.x86_64.rpm
-```
-
-For `aarch64` substitute the matching RPM. Dependencies (`glibc`, `acl`,
-`shadow-utils`) are resolved automatically.
-
-### Portable tarball (any glibc 2.35+ distro)
-
-```sh
-VERSION=0.1.0
-curl -LO https://github.com/Tristram1337/janitor/releases/download/v${VERSION}/janitor-${VERSION}-linux-amd64.tar.gz
-tar xzf janitor-${VERSION}-linux-amd64.tar.gz
-cd janitor-${VERSION}-linux-amd64
-sudo install -m 0755 janitor /usr/local/bin/
-sudo install -m 0644 janitor.1 /usr/local/share/man/man1/
+VERSION=0.1.5
+curl -LO "https://github.com/Tristram1337/janitor/releases/download/v${VERSION}/janitor-${VERSION}-linux-amd64-static.tar.gz"
+tar xzf "janitor-${VERSION}-linux-amd64-static.tar.gz"
+sudo install -m 0755 "janitor-${VERSION}-linux-amd64-static/janitor" /usr/local/bin/
+sudo install -m 0644 "janitor-${VERSION}-linux-amd64-static/janitor.1" /usr/local/share/man/man1/
 janitor completions bash | sudo tee /etc/bash_completion.d/janitor >/dev/null
 ```
 
-A fully static build (`linux-amd64-static`, `linux-arm64-static`) is also
-published for systems without a compatible glibc (Alpine, minimal containers).
+The static (musl) binary has **no glibc requirement** and runs on every
+Linux x86_64 system from RHEL 8 / Ubuntu 22.04 (kernel 4.18) to Fedora 43
+(kernel 6.17). This is the recommended install method.
+
+### Debian / Ubuntu
+
+```sh
+VERSION=0.1.5
+curl -LO "https://github.com/Tristram1337/janitor/releases/download/v${VERSION}/janitor_${VERSION}-1_amd64.deb"
+sudo apt install "./janitor_${VERSION}-1_amd64.deb"
+```
+
+The package installs the binary to `/usr/bin/janitor`, the man page to
+`/usr/share/man/man1/janitor.1.gz`, and shell completions for bash, zsh,
+and fish. Dependencies (`acl`, `passwd`) are pulled in automatically.
+
+> **Note:** The `.deb` package uses the glibc build (requires glibc >= 2.39,
+> i.e. Debian 13+ / Ubuntu 24.04+). For older releases use the static binary above.
+
+### Red Hat / Fedora / Rocky / Alma / CentOS Stream
+
+```sh
+VERSION=0.1.5
+sudo dnf install "https://github.com/Tristram1337/janitor/releases/download/v${VERSION}/janitor-${VERSION}-1.x86_64.rpm"
+```
+
+Dependencies (`glibc`, `acl`, `shadow-utils`) are resolved automatically.
+
+> **Note:** The `.rpm` package uses the glibc build (requires glibc >= 2.39,
+> i.e. Fedora 42+ / RHEL 10+ / CentOS Stream 10+). For RHEL 8/9, Rocky,
+> or Alma 8/9 use the static binary above.
+
+### Portable tarball (glibc >= 2.39 only)
+
+For systems where you know glibc >= 2.39 is available (Debian 13+, Ubuntu 24.04+, Fedora 42+):
+
+```sh
+VERSION=0.1.5
+curl -LO "https://github.com/Tristram1337/janitor/releases/download/v${VERSION}/janitor-${VERSION}-linux-amd64.tar.gz"
+tar xzf "janitor-${VERSION}-linux-amd64.tar.gz"
+sudo install -m 0755 "janitor-${VERSION}-linux-amd64/janitor" /usr/local/bin/
+```
+
+For older systems, use the static binary instead.
 
 ### From source
 
@@ -81,25 +100,17 @@ published for systems without a compatible glibc (Alpine, minimal containers).
 cargo install --path .
 ```
 
-### Static binary (recommended — runs everywhere)
-
-```sh
-VERSION=0.1.4
-curl -LO https://github.com/Tristram1337/janitor/releases/download/v${VERSION}/janitor-linux-amd64-static
-sudo install -m 0755 janitor-linux-amd64-static /usr/local/bin/janitor
-```
-
-The static (musl) binary has **no glibc requirement** and runs on every
-Linux x86_64 system from RHEL 8 / Ubuntu 22.04 to Fedora 43.
-
 ### Runtime dependencies
 
-- **glibc build:** requires glibc >= 2.39 (Debian 13+, Ubuntu 24.04+, Fedora 42+).
-  The `.deb` and `.rpm` packages use the glibc build.
-- **Static (musl) build:** no glibc requirement. Runs on any Linux x86_64 kernel >= 4.18 (RHEL 8+, Debian 12+, Ubuntu 22.04+).
-- `acl` package (for `janitor acl` subcommands): `apt install acl` or `dnf install acl`.
-- `shadow-utils` (`groupadd`, `gpasswd`) for the automatic managed-group feature of `grant`.
-- The Debian and RPM packages declare these as dependencies automatically.
+| Build | glibc requirement | Minimum kernel | Distros |
+|-------|-------------------|----------------|---------|
+| **Static (musl)** | none | 4.18 | RHEL 8+, Debian 12+, Ubuntu 22.04+, Alpine, any |
+| **Dynamic (glibc)** | >= 2.39 | 4.18 | Debian 13+, Ubuntu 24.04+, Fedora 42+, RHEL 10+ |
+
+Additional runtime dependencies (for full functionality):
+- `acl` package (`setfacl`/`getfacl`) — needed by `janitor acl` subcommands.
+- `shadow-utils` (`groupadd`, `gpasswd`) — needed by `janitor grant` managed groups.
+- The `.deb` and `.rpm` packages declare these automatically.
 
 ---
 
@@ -438,7 +449,7 @@ Every mutating command writes a MessagePack (`.mpk`) snapshot before it touches 
 ~/.local/share/janitor/backups/      # when run as a normal user
 ```
 
-Each snapshot contains mode, uid, gid, symlink-ness, and optionally ACLs for every path it intends to modify (parents + target + recursive children). Restore is atomic per path:
+Each snapshot contains mode, uid, gid, symlink-ness, and POSIX ACLs for every path it intends to modify (parents + target + recursive children). ACLs are always included by default; pass `--no-acl` to omit them. Restore is atomic per path:
 
 ```sh
 janitor list-backups                 # list available snapshots
@@ -532,23 +543,24 @@ CI runs unit + Docker smoke tests on every push.
 
 ### Tested distributions
 
-The v0.1.4 release passes **4,400+ assertions across 11 distributions** with zero failures:
+The v0.1.5 release passes **4,812 assertions across 12 distributions** with zero failures:
 
-| Distribution | Version | Kernel | Filesystem | SELinux | Smoke (263) | Cross-distro (138) |
-|---|---|---|---|---|---|---|
-| Rocky Linux | 8.8 | 4.18 | XFS | Enforcing | 263/0 | 138/0 |
-| Rocky Linux | 9.2 | 5.14 | XFS | Enforcing | 263/0 | 138/0 |
-| AlmaLinux | 8.10 | 4.18 | XFS | Enforcing | 263/0 | 138/0 |
-| AlmaLinux | 9.7 | 5.14 | XFS | Enforcing | 263/0 | 138/0 |
-| CentOS Stream | 9 | 5.14 | XFS | Enforcing | 263/0 | 138/0 |
-| Fedora | 42 | 6.14 | Btrfs | Enforcing | 262/0 | 138/0 |
-| Fedora | 43 | 6.17 | Btrfs | Enforcing | 262/0 | 138/0 |
-| Debian | 12 (bookworm) | 6.1 | ext4 | — | 263/0 | 138/0 |
-| Debian | 13 (trixie) | 6.12 | ext4 | — | 263/0 | 138/0 |
-| Ubuntu | 22.04 LTS | 5.15 | ext4 | — | 263/0 | 138/0 |
-| Ubuntu | 24.04 LTS | 6.8 | ext4 | — | 263/0 | 138/0 |
+| Distribution | Version | Kernel | glibc | Filesystem | SELinux | Smoke (263) | Cross-distro (138) |
+|---|---|---|---|---|---|---|---|
+| Rocky Linux | 8.8 | 4.18 | 2.28 | XFS | Enforcing | 263/0 | 138/0 |
+| Rocky Linux | 9.2 | 5.14 | 2.34 | XFS | Enforcing | 263/0 | 138/0 |
+| AlmaLinux | 8.10 | 4.18 | 2.28 | XFS | Enforcing | 263/0 | 138/0 |
+| AlmaLinux | 9.7 | 5.14 | 2.34 | XFS | Enforcing | 263/0 | 138/0 |
+| CentOS Stream | 9 | 5.14 | 2.34 | XFS | Enforcing | 263/0 | 138/0 |
+| Fedora | 42 | 6.14 | 2.41 | Btrfs | Enforcing | 262/0 | 138/0 |
+| Fedora | 43 | 6.17 | 2.41 | Btrfs | Enforcing | 262/0 | 138/0 |
+| Debian | 12 (bookworm) | 6.1 | 2.36 | ext4 | — | 263/0 | 138/0 |
+| Debian | 13 (trixie) | 6.12 | 2.40 | ext4 | — | 263/0 | 138/0 |
+| Ubuntu | 22.04 LTS | 5.15 | 2.35 | ext4 | — | 263/0 | 138/0 |
+| Ubuntu | 24.04 LTS | 6.8 | 2.39 | ext4 | — | 263/0 | 138/0 |
+| Ubuntu | 25.10 | 6.17 | 2.42 | ext4 | — | 263/0 | 138/0 |
 
-Filesystems tested: **XFS, Btrfs, ext4**. SELinux enforcing on 7 of 11 hosts with zero AVC denials. Kernel range: 4.18 (RHEL 8) through 6.17 (Fedora 43). Static musl binary used on all hosts.
+Filesystems tested: **XFS, Btrfs, ext4, tmpfs**. SELinux enforcing on 7 of 12 hosts with zero AVC denials. Kernel range: 4.18 (RHEL 8) through 6.17 (Fedora 43 / Ubuntu 25.10). glibc range: 2.28 through 2.42. Static musl binary used on all hosts.
 
 ---
 
