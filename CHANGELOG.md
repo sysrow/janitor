@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-09
+
+Static musl binary for broad distro compatibility and test fixes.
+
+### Added
+- **Static musl binary (`janitor-linux-amd64-static`):** zero glibc
+  dependency, runs on any Linux from RHEL 8 / Ubuntu 22.04 (kernel 4.18,
+  glibc 2.28) to Fedora 43 (kernel 6.17, glibc 2.41). The dynamic build
+  still requires glibc 2.39+.
+- **12-distro validation matrix:** Rocky 8.8, Rocky 9.2, AlmaLinux 8.10,
+  AlmaLinux 9.7, CentOS Stream 9, Fedora 42, Fedora 43, Debian 12,
+  Debian 13, Ubuntu 22.04, Ubuntu 24.04, Ubuntu 25.10 — all 401 assertions
+  pass on every host. Documented in README.
+
+### Fixed
+- **Smoke tests: `restore`/`undo` missing `--yes`:** non-TTY runs silently
+  skipped restore operations because the interactive confirmation prompt
+  exited without action. Added `--yes` to all restore/undo calls in the
+  test suite.
+
 ## [0.1.4] - 2026-05-09
 
 Backups now always capture POSIX ACLs. Cross-distribution validation on
