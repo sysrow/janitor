@@ -716,10 +716,10 @@ FAP=$($JAN grant "$ROOT/deep/dir/target.txt" -u "$USER" -a r --force-all-parents
 assert_grep "--force-all-parents backup" "$FAP" "backup:"
 chmod 700 "$ROOT"
 
-# ── 50. chmod + chown -A capture-acl ───────────────────────────────
+# ── 50. chmod captures ACLs by default ─────────────────────────────
 chmod 600 "$ROOT/deep/dir/target.txt"
 setfacl -m u:"$USER":rw "$ROOT/deep/dir/target.txt"
-CA=$($JAN chmod 640 "$ROOT/deep/dir/target.txt" -A 2>&1)
+CA=$($JAN chmod 640 "$ROOT/deep/dir/target.txt" 2>&1)
 CA_BID=$(echo "$CA" | awk '/^backup:/ {print $2}')
 setfacl -b "$ROOT/deep/dir/target.txt"
 $JAN r "$CA_BID" --yes > /dev/null 2>&1

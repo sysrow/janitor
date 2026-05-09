@@ -79,9 +79,9 @@ first; revert anytime with `janitor restore <id>`."
         /// Modify parents even if one is already world-readable (normally skipped).
         #[arg(long)]
         force_all_parents: bool,
-        /// Also record existing POSIX ACLs in the snapshot (so `restore` brings them back).
+        /// Skip capturing POSIX ACLs in the snapshot (ACLs are recorded by default).
         #[arg(long)]
-        capture_acl: bool,
+        no_acl: bool,
         /// Skip any path matching this glob (repeatable, matches full path or basename).
         #[arg(short = 'E', long = "exclude", value_name = "GLOB")]
         exclude: Vec<String>,
@@ -143,9 +143,9 @@ For partial (bit-level) revocation, use one of:\n  \
         /// Recurse into directories.
         #[arg(short = 'R', long)]
         recursive: bool,
-        /// Also record ACLs for every path.
-        #[arg(short = 'A', long)]
-        capture_acl: bool,
+        /// Skip capturing POSIX ACLs (ACLs are recorded by default).
+        #[arg(long)]
+        no_acl: bool,
     },
 
     /// Restore a backup by id (full revert).
@@ -267,9 +267,9 @@ Revert with `janitor restore <id>`.")]
         /// Apply recursively.
         #[arg(short = 'R', long)]
         recursive: bool,
-        /// Also capture ACLs in the snapshot.
-        #[arg(short = 'A', long)]
-        capture_acl: bool,
+        /// Skip capturing POSIX ACLs in the snapshot (ACLs are recorded by default).
+        #[arg(long)]
+        no_acl: bool,
         /// Copy the mode from another file (MODE argument is ignored).
         #[arg(short = 'F', long = "reference", value_name = "FILE")]
         reference: Option<String>,
@@ -311,9 +311,9 @@ Revert with `janitor restore <id>`."
         /// Apply recursively.
         #[arg(short = 'R', long)]
         recursive: bool,
-        /// Also capture ACLs in the snapshot.
-        #[arg(short = 'A', long)]
-        capture_acl: bool,
+        /// Skip capturing POSIX ACLs in the snapshot (ACLs are recorded by default).
+        #[arg(long)]
+        no_acl: bool,
         /// Copy the owner/group from another file (SPEC argument is ignored).
         #[arg(short = 'F', long = "reference", value_name = "FILE")]
         reference: Option<String>,
@@ -785,7 +785,7 @@ sudo janitor preset group-shared /srv/team -R\n\nSHORT FLAGS\n  \
 -n dry-run   -j json\n  \
 -u user      -g group  -a access-string    -r read  -w write  -x exec\n  \
 -R recursive           -L max-level        -d default (acl)\n  \
--A has-acl / capture-acl / acl-marker\n  \
+-A has-acl / copy-acl / acl-marker\n  \
 -W world-writable      -s setuid   -S setgid    -t sticky   -o owner   -m mode\n\nSee `man janitor` for the full manual with workflows and more examples.";
 
 /// Resolve the effective access string from boolean flags and the optional `-a` string.

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-09
+
+Backups now always capture POSIX ACLs. Cross-distribution validation on
+CentOS Stream 10, AlmaLinux 10.1, Rocky Linux 10.0, Ubuntu 25.10, and
+Ubuntu 24.04 LTS — zero SELinux AVC denials, RPM/DEB packages verified.
+
+### Changed
+- **ACLs captured by default in all snapshots:** `backup`, `chmod`, `chown`,
+  and `grant` now record POSIX ACLs automatically. The old `-A` /
+  `--capture-acl` opt-in flag is replaced by `--no-acl` opt-out. A backup
+  is now a true 1:1 copy of filesystem state — `restore` brings back ACLs
+  along with mode and ownership.
+
+### Fixed
+- **Audit on tmpfs (`/tmp`) returned zero results:** `is_pseudo_fs()` was
+  checked on every directory, causing scans under tmpfs-mounted paths
+  (standard on modern Ubuntu/Fedora) to silently skip all entries. Now
+  pseudo-fs detection only triggers when crossing a mount boundary
+  (`st_dev` changes), so auditing `/tmp/mydir` works correctly.
+
+### Added
+- **Cross-distribution test suite** (`tests/cross-distro-test.sh`): 138
+  assertions covering SELinux context preservation, XFS/ext4 ACL behaviour,
+  `chattr` flags, seal pinholes with `runuser` access checks, `find-orphans`,
+  concurrent flock serialisation, 10k-file trees on 512 MB hosts, Unicode
+  filenames, deep nesting (50 levels), and more.
+- **Test orchestrator** (`tests/distro-test-orchestrator.sh`): parallel
+  deploy + run across DigitalOcean droplets.
+- RPM and DEB packages verified on Rocky Linux 10.0 and Ubuntu 25.10
+  (binary, man page, bash/zsh/fish completions all at correct distro paths).
+
 ## [0.1.3] - 2026-05-08
 
 Correctness and safety pass: symlink handling, setuid/setgid restore order,

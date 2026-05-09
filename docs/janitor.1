@@ -99,7 +99,7 @@ man	Emit a roff man page to stdout
 .IR N ]
 .RB [ \-R ]
 .RB [ \-\-force\-all\-parents ]
-.RB [ \-\-capture\-acl ]
+.RB [ \-\-no\-acl ]
 .PP
 Grant
 .I USER
@@ -161,10 +161,11 @@ Also apply the grant to every file and subdirectory under
 Grant even if a parent is world-readable (normally a warning is emitted and the grant
 continues; this flag suppresses the warning check).
 .TP
-.B \-\-capture\-acl
-Include existing ACLs in the snapshot taken before the change, so
+.B \-\-no\-acl
+Do not capture POSIX ACLs in the pre-change snapshot (by default ACLs are
+always recorded, so
 .B restore
-also brings ACLs back (otherwise only mode and owner are captured).
+brings them back along with mode and owner).
 .SS revoke
 .B janitor revoke
 .I PATH
@@ -221,7 +222,7 @@ marker is appended to the mode of entries that carry POSIX ACLs.
 .B janitor chmod
 .I MODE PATH
 .RB [ \-R ]
-.RB [ \-A ]
+.RB [ \-\-no\-acl ]
 .RB [ \-F\ FILE " | " \-\-reference\ FILE ]
 .PP
 Change the mode using octal or symbolic notation. An auto-snapshot is taken
@@ -286,7 +287,7 @@ as a placeholder).
 .B janitor chown
 .I SPEC PATH
 .RB [ \-R ]
-.RB [ \-A ]
+.RB [ \-\-no\-acl ]
 .RB [ \-F\ FILE " | " \-\-reference\ FILE ]
 .PP
 Change owner/group.
@@ -339,11 +340,12 @@ on that inode. Alias:
 .B janitor backup
 .I PATH
 .RB [ \-R ]
-.RB [ \-A ]
+.RB [ \-\-no\-acl ]
 .PP
-Snapshot current mode, owner, group, and (with
-.BR \-A )
-ACLs without making any change. Output includes the backup id.
+Snapshot current mode, owner, group, and ACLs without making any change.
+Use
+.B \-\-no\-acl
+to omit POSIX ACLs from the snapshot. Output includes the backup id.
 .SS restore
 .B janitor restore
 .I BACKUP_ID
@@ -1014,7 +1016,7 @@ sudo janitor copy-perms /srv/template        /srv/new -R -A
 .PP
 .RS
 .EX
-sudo janitor backup /srv/project -R -A
+sudo janitor backup /srv/project -R
 sudo janitor list-backups
 sudo janitor list-backups -p /srv/project
 sudo janitor history      /srv/project
