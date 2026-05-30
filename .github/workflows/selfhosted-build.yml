@@ -1,0 +1,18 @@
+name: Self-hosted build
+
+# Manual trigger only. Builds the Rust crate on the self-hosted runner (tristram).
+# Note: the Rust toolchain path under the hardened sandbox is not yet verified;
+# the first run will confirm or require a ReadWritePaths addition.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: [self-hosted, tristram]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked
