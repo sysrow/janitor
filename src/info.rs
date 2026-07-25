@@ -90,33 +90,6 @@ fn humanize_age(secs: u64) -> String {
     }
 }
 
-fn unix_to_ymdhm(t: u64) -> (i32, u32, u32, u32, u32) {
-    let days = (t / 86400) as i64;
-    let hms = (t % 86400) as u32;
-    let (h, m) = (hms / 3600, (hms / 60) % 60);
-    let (y, mo, d) = days_to_ymd(days);
-    (y, mo, d, h, m)
-}
-
-/// Civil days since 1970-01-01 → (year, month, day). Howard Hinnant.
-fn days_to_ymd(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 {
-        z / 146_097
-    } else {
-        (z - 146_096) / 146_097
-    };
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let year = (if m <= 2 { y + 1 } else { y }) as i32;
-    (year, m, d)
-}
-
 /// Effective (read, write, execute/traverse) for `username` on this inode.
 fn effective_for_user(
     path: &std::path::Path,

@@ -5,6 +5,14 @@
 //! boxes (error/warning/note/hint), summary lines, table builder, and
 //! `indicatif` progress helpers.
 //!
+//! The toolkit is deliberately wider than what the current commands call —
+//! several helpers exist so a new subcommand does not have to reinvent
+//! them. Hence the module-scoped `dead_code` allowance below. It is scoped
+//! to this module on purpose: the crate used to carry it globally, which is
+//! how two `SnapEntry` fields ended up written into every backup and read
+//! by nothing at all.
+#![allow(dead_code)]
+//!
 //! All user-facing commands should go through these primitives so the CLI
 //! stays visually coherent. Colors are supplementary: layout, glyphs, and
 //! badge text always carry the signal on their own, which means output

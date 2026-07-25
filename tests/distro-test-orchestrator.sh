@@ -5,6 +5,16 @@
 # to tests/hosts.env (git-ignored) and fill in your own targets.
 #
 # Run from the repo root, after `cargo build --release`.
+#
+# Test status of this script itself (rewritten 2026-07):
+#   exercised  - missing/empty hosts.env guards, per-job exit-status capture,
+#                and the failure accounting (an unreachable host is reported
+#                as a failure, not as "ALL TESTS PASSED", which is what the
+#                pre-rewrite version did)
+#   NOT exercised - the happy path. Deploy, provision and the two suites have
+#                not been run against real hosts since the rewrite, because
+#                the previous inventory was removed from the repo along with
+#                its addresses. Expect to debug this on its first real run.
 set -uo pipefail
 
 BINARY="target/release/janitor"

@@ -5,7 +5,8 @@
 #![allow(clippy::print_literal)]
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::collapsible_else_if)]
-#![allow(dead_code)]
+// No crate-wide dead_code suppression: it is what let two SnapEntry fields
+// be written to every backup and never read by anything.
 
 mod access;
 mod acl;

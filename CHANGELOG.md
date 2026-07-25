@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Removed the crate-wide `#![allow(dead_code)]`. It is what let two
+  `SnapEntry` fields be written into every backup and read by nothing;
+  `restore` now consumes `acl_unavailable` and warns when a backup holds
+  entries whose ACLs were never captured. `render` keeps a module-scoped
+  allowance for its deliberately-wider toolkit; nothing else does.
+- Dropped `access::effective_for_user` and its `resolve_acl_path` stub. The
+  metadata-based variant structurally could not see ACLs, sitting next to
+  a path-based one that can — a trap rather than an API. Also dropped the
+  hand-rolled civil-date helpers in `info`, superseded by `chrono`.
+
+### Documentation
+
+- README gains an "Upgrading from 0.1.5" section: what to re-check after
+  the behaviour changes in 0.1.6/0.1.7, led by the `seal` re-seal step.
+- CONTRIBUTING gains "A fix is not done until something proves it",
+  written from the §H-02 miss.
+- `tests/distro-test-orchestrator.sh` states plainly which of its paths
+  have been exercised since the rewrite and which have not.
+
+### Testing
+
+- The last unverified claim from the audit review now has a test: the
+  smoke suite swaps in a failing `getfacl` and asserts the mutation is
+  refused, distinct from the "getfacl not installed" case, which is not an
+  error. Every fix in the 0.1.6/0.1.7 batch now has a test or a recorded
+  reproduction.
+
 ## [0.1.7] - 2026-07-25
 
 Ships one fix that 0.1.6's changelog claimed but did not contain.
