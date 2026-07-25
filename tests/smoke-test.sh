@@ -44,6 +44,23 @@ tty_run() {
 }
 
 ROOT=/tmp/pm_smoke
+
+# Pick an unused uid/gid that this kernel/namespace can actually assign, and
+# chown $1 to it. 99999 is outside the subuid map of a rootless container, so
+# `chown 99999` fails there with EINVAL and the "orphan" tests below silently
+# tested nothing. Probe downwards for one that works.
+pick_orphan_id() {
+    local probe
+    for probe in 99999 60000 59999 59998; do
+        getent passwd "$probe" > /dev/null 2>&1 && continue
+        getent group "$probe" > /dev/null 2>&1 && continue
+        if chown "$probe:$probe" "$1" 2>/dev/null; then
+            echo "$probe"
+            return 0
+        fi
+    done
+    return 1
+}
 USER=pm_smoke_user
 USER2=pm_smoke_user2
 
@@ -485,7 +502,7 @@ OUTSIDE_BEFORE=$(stat -c '%U:%G' "$ROOT/target-outside-tree")
 ln -sf "$ROOT/target-outside-tree" "$ROOT/chowntree/link"
 $JAN chown "$USER:$USER" "$ROOT/chowntree" -R > /dev/null 2>&1
 OUTSIDE_AFTER=$(stat -c '%U:%G' "$ROOT/target-outside-tree")
-LINK_OWNER=$(stat -hc '%U:%G' "$ROOT/chowntree/link")        # the symlink itself
+LINK_OWNER=$(stat -c '%U:%G' "$ROOT/chowntree/link")         # stat does not deref by default
 if [[ "$OUTSIDE_BEFORE" == "$OUTSIDE_AFTER" ]]; then pass "chown -R does not follow symlinks (target untouched)"; else fail "chown -R followed symlink! before=$OUTSIDE_BEFORE after=$OUTSIDE_AFTER"; fi
 if [[ "$LINK_OWNER" == "$USER:$USER" ]]; then pass "chown -R lchowns the symlink itself"; else fail "chown -R left link at $LINK_OWNER"; fi
 rm -rf "$ROOT/chowntree" "$ROOT/target-outside-tree"
@@ -501,7 +518,7 @@ ln -sfn "$ROOT/direct-target" "$ROOT/direct-link"
 DT_BEFORE=$(stat -c '%U:%G %a' "$ROOT/direct-target")
 $JAN chown "$USER:$USER" "$ROOT/direct-link" > /dev/null 2>&1
 DT_AFTER=$(stat -c '%U:%G %a' "$ROOT/direct-target")
-DL_OWNER=$(stat -hc '%U:%G' "$ROOT/direct-link")
+DL_OWNER=$(stat -c '%U:%G' "$ROOT/direct-link")
 if [[ "$DT_BEFORE" == "$DT_AFTER" ]]; then pass "direct chown on a symlink leaves the target alone"; else fail "direct chown followed symlink! before=$DT_BEFORE after=$DT_AFTER"; fi
 if [[ "$DL_OWNER" == "$USER:$USER" ]]; then pass "direct chown changes the symlink itself"; else fail "direct chown left link at $DL_OWNER"; fi
 $JAN chmod 0600 "$ROOT/direct-link" > /dev/null 2>&1
@@ -646,9 +663,12 @@ FO=$($JAN find-orphans "$ROOT" 2>&1)
 if echo "$FO" | grep -q "no orphan\|orphan"; then pass "find-orphans ran"; else pass "find-orphans empty ok"; fi
 
 # create an orphan
-chown 99999:99998 "$ROOT/deep/sibling.txt"
-FO2=$($JAN find-orphans "$ROOT" 2>&1)
-assert_grep "find-orphans detects orphan" "$FO2" "sibling.txt"
+if ORPHAN_ID=$(pick_orphan_id "$ROOT/deep/sibling.txt"); then
+    FO2=$($JAN find-orphans "$ROOT" 2>&1)
+    assert_grep "find-orphans detects orphan (uid $ORPHAN_ID)" "$FO2" "sibling.txt"
+else
+    echo "  SKIP  find-orphans detects orphan (no assignable unused uid here)"
+fi
 chown root:root "$ROOT/deep/sibling.txt"
 
 # ── 32. who-can ─────────────────────────────────────────────────────
@@ -887,11 +907,15 @@ assert_grep "audit -x finds world-executable" "$AX" "audit2/wrx"
 
 # orphan uid/gid
 touch "$ROOT/audit2/orphan"
-chown 99991:99991 "$ROOT/audit2/orphan" 2>/dev/null || true
-ANO=$($JAN audit "$ROOT/audit2" --no-owner 2>&1 || true)
-assert_grep "audit --no-owner"   "$ANO" "audit2/orphan"
-ANG=$($JAN audit "$ROOT/audit2" --no-group 2>&1 || true)
-assert_grep "audit --no-group"   "$ANG" "audit2/orphan"
+if AUDIT_ORPHAN_ID=$(pick_orphan_id "$ROOT/audit2/orphan"); then
+    ANO=$($JAN audit "$ROOT/audit2" --no-owner 2>&1 || true)
+    assert_grep "audit --no-owner (uid $AUDIT_ORPHAN_ID)"   "$ANO" "audit2/orphan"
+    ANG=$($JAN audit "$ROOT/audit2" --no-group 2>&1 || true)
+    assert_grep "audit --no-group (gid $AUDIT_ORPHAN_ID)"   "$ANG" "audit2/orphan"
+else
+    echo "  SKIP  audit --no-owner (no assignable unused uid here)"
+    echo "  SKIP  audit --no-group (no assignable unused gid here)"
+fi
 rm -rf "$ROOT/audit2"
 
 # ── 54. history command ─────────────────────────────────────────────
