@@ -22,7 +22,13 @@ invisible. Every mutating command writes a MessagePack snapshot to
 .PP
 Symlinks' own permission bits are never modified;
 .BR lchown (2)
-is used so symlinks are repointed by owner without following them.
+is used so symlinks are repointed by owner without following them. This
+holds for a symlink named directly on the command line as well, which is
+where janitor deliberately differs from coreutils: GNU
+.BR chmod (1)
+and
+.BR chown (1)
+dereference their operands.
 .PP
 Most subcommands take the target
 .I PATH
@@ -245,6 +251,30 @@ automatic snapshot, lock-check, variadic paths,
 and
 .BR \-\-reference .
 .PP
+.B Umask and symbolic modes.
+A symbolic mode with no
+.I who
+part behaves as if
+.B a
+were given, except that bits set in the process umask are left alone \(em as
+POSIX requires. Under
+.BR "umask 077" ,
+.B +x
+on a
+.I 0600
+file yields
+.IR 0700 ,
+not
+.IR 0711 .
+Spell out
+.B a
+.RB ( a+x )
+to ignore the umask.
+.PP
+A recursive chmod applies the deepest paths first, so tightening a tree does
+not remove the traverse bit from a directory whose children still have to be
+changed.
+.PP
 .B Octal forms
 support the full 4-digit syntax with special bits:
 .IP \(bu 2
@@ -349,12 +379,35 @@ to omit POSIX ACLs from the snapshot. Output includes the backup id.
 .SS restore
 .B janitor restore
 .I BACKUP_ID
+.RB [ \-\-yes ]
+.RB [ \-\-skip\-missing ]
+.RB [ \-\-allow\-replaced ]
 .PP
 Revert a snapshot. Mode, owner, group, and (if captured) ACLs are restored
 atomically per path. Symlinks use
 .BR lchown (2).
+If the backup recorded a
+.B grant
+that created a managed group or added a user to one, those account changes
+are reverted too.
+.PP
+Each entry is checked against the snapshot before it is written: an entry
+whose file type or inode changed is refused, so a path replaced by a symlink
+or hard link since the backup cannot redirect the change to another file.
+Paths that no longer exist count as errors unless
+.B \-\-skip\-missing
+is given.
+.PP
+An ordinary editor save is write-then-rename, which produces a new inode too,
+so restoring a file you have since edited reports it as replaced. Pass
+.B \-\-allow\-replaced
+when that is what happened; the file-type check still applies, so a path
+swapped for a symlink is refused either way.
 .SS undo
 .B janitor undo
+.RB [ \-\-yes ]
+.RB [ \-\-skip\-missing ]
+.RB [ \-\-allow\-replaced ]
 .PP
 Restore the most recent backup. Shortcut for looking up the newest snapshot
 and running
@@ -419,9 +472,17 @@ Dump a backup as text or JSON (with
 .RB [ \-A ]
 .RB [ \-\-no\-owner ]
 .RB [ \-\-no\-group ]
+.RB [ \-\-best\-effort ]
 .PP
 Scan a tree for entries matching one or more security-relevant filters.
 Multiple filters are AND-ed.
+.PP
+Paths the scan cannot read are listed and make the command exit non-zero:
+a clean result would otherwise cover only whatever happened to be
+reachable, which for a security scan is the one answer that must never be
+given silently. Pass
+.B \-\-best\-effort
+to accept a partial scan and exit 0 anyway.
 .TP
 .BR \-W ", " \-\-world\-writable
 Entries with the other+w bit set.

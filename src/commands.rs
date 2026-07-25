@@ -9,10 +9,10 @@ use crate::backup::{load_backup, save_backup};
 use crate::errors::{PmError, Result};
 use crate::groups::{add_user_to_group, ensure_group, remove_user_from_group};
 use crate::helpers::{
-    default_group_name, parse_access, path_chain, resolve_path, validate_group_name,
+    default_group_name, parse_access, path_chain, resolve_path_nofollow, validate_group_name,
 };
 use crate::locking::with_lock;
-use crate::perms::{apply_group_bits, apply_restore};
+use crate::perms::{apply_group_bits, apply_restore, RestoreOptions};
 use crate::render::{self, glyphs, paint, summary_line, DiagLevel, Style};
 use crate::snapshot::snapshot_with_acl;
 use crate::types::{AccessBits, Operation};
@@ -37,7 +37,7 @@ pub fn cmd_grant(
         lookup_user(u)?; // fail fast
     }
 
-    let target = resolve_path(path)?;
+    let target = resolve_path_nofollow(path)?;
     crate::locks::ensure_not_locked(&target)?;
     let access_bits = parse_access(access)?;
 
@@ -89,7 +89,11 @@ pub fn cmd_grant(
         }
     }
 
-    // ── Narrate: group ensure + user add (dry-run predicts; apply acts) ─
+    // ── Narrate: group ensure + user add ─────────────────────────────
+    // Narration only. The groupadd/gpasswd calls themselves happen inside
+    // the transaction below, after the backup exists — doing them here
+    // meant a later failure left account changes behind with no backup
+    // recording that they had been made.
     let group_existed = group_exists(&group_name);
     let user_in = user.map(|u| user_in_group(u, &group_name)).unwrap_or(true);
     narrate_action(
@@ -99,9 +103,6 @@ pub fn cmd_grant(
         "ensure group",
         &paint(Style::Group, &group_name),
     );
-    if !dry_run {
-        ensure_group(&group_name, false)?;
-    }
     if let Some(u) = user {
         narrate_action(
             stdout_tty,
@@ -115,13 +116,20 @@ pub fn cmd_grant(
                 paint(Style::Group, &group_name)
             ),
         );
-        if !dry_run {
-            add_user_to_group(u, &group_name, false)?;
-        }
     }
 
     // Build list of paths to touch.
     let chain = path_chain(&target, Path::new("/"));
+    // `/` has no chain: path_chain stops at the root, so there is no target
+    // segment to grant on. Refuse before anything mutates rather than
+    // panicking on an empty chain further down.
+    if chain.is_empty() {
+        return Err(PmError::Other(format!(
+            "refusing to grant on {}: it has no parent chain to make traversable\n       \
+             (grant on a specific path inside it instead)",
+            target.display()
+        )));
+    }
     let parents = if let Some(n) = max_level {
         let all_parents = &chain[..chain.len().saturating_sub(1)];
         let start = all_parents.len().saturating_sub(n);
@@ -174,9 +182,11 @@ pub fn cmd_grant(
 
     with_lock(|| {
         // Single backup covering parents + target + recursive descendants.
+        // It also records which account changes this grant is about to make,
+        // so `restore` / `undo` can take them back out again.
         let mut backup_id: Option<String> = None;
         if !dry_run {
-            let snap = snapshot_with_acl(&all_paths, capture_acl);
+            let snap = snapshot_with_acl(&all_paths, capture_acl)?;
             let op = Operation {
                 op_type: "grant".into(),
                 user: user.map(String::from),
@@ -187,8 +197,16 @@ pub fn cmd_grant(
                 max_level,
                 recursive: Some(recursive),
                 parent_op: None,
+                group_created: !group_existed,
+                user_added: !user_in,
             };
             backup_id = Some(save_backup(snap, op)?);
+
+            // Only now, with the backup on disk, touch the account database.
+            ensure_group(&group_name, false)?;
+            if let Some(u) = user {
+                add_user_to_group(u, &group_name, false)?;
+            }
         }
 
         // Parents: exactly `x` (traverse), replace existing group triad.
@@ -383,7 +401,7 @@ fn collect_recursive(target: &Path, exclude: &crate::matcher::ExcludeSet) -> Vec
 }
 
 pub fn cmd_revoke(user: &str, path: &str, group: Option<&str>, dry_run: bool) -> Result<()> {
-    let target = resolve_path(path)?;
+    let target = resolve_path_nofollow(path)?;
     let group_name = match group {
         Some(g) => g.to_string(),
         None => default_group_name(&target),
@@ -397,14 +415,14 @@ pub fn cmd_revoke(user: &str, path: &str, group: Option<&str>, dry_run: bool) ->
 }
 
 pub fn cmd_backup(path: &str, recursive: bool, capture_acl: bool) -> Result<()> {
-    let target = resolve_path(path)?;
+    let target = resolve_path_nofollow(path)?;
     let mut paths = vec![target.clone()];
     if recursive && target.is_dir() {
         let empty = crate::matcher::ExcludeSet::new(&[])?;
         paths.extend(collect_recursive(&target, &empty));
     }
     with_lock(|| {
-        let snap = snapshot_with_acl(&paths, capture_acl);
+        let snap = snapshot_with_acl(&paths, capture_acl)?;
         let count = snap.len();
         let bid = save_backup(
             snap,
@@ -418,6 +436,8 @@ pub fn cmd_backup(path: &str, recursive: bool, capture_acl: bool) -> Result<()> 
                 max_level: None,
                 recursive: Some(recursive),
                 parent_op: None,
+                group_created: false,
+                user_added: false,
             },
         )?;
         println!("backup: {bid}  ({count} entries)");
@@ -425,13 +445,13 @@ pub fn cmd_backup(path: &str, recursive: bool, capture_acl: bool) -> Result<()> 
     })
 }
 
-pub fn cmd_restore(backup_id: &str, dry_run: bool, assume_yes: bool) -> Result<()> {
+pub fn cmd_restore(backup_id: &str, assume_yes: bool, opts: RestoreOptions) -> Result<()> {
     let data = load_backup(backup_id)?;
-    restore_with_preview(&data, dry_run, assume_yes, "restore")
+    restore_with_preview(&data, assume_yes, opts, "restore")
 }
 
 /// Undo the most recent backup (newest by file mtime).
-pub fn cmd_undo(dry_run: bool, assume_yes: bool) -> Result<()> {
+pub fn cmd_undo(assume_yes: bool, opts: RestoreOptions) -> Result<()> {
     let files = crate::backup::list_backup_files()?;
     let latest = files
         .iter()
@@ -447,15 +467,16 @@ pub fn cmd_undo(dry_run: bool, assume_yes: bool) -> Result<()> {
         .ok_or_else(|| PmError::Other("invalid backup filename".into()))?
         .to_string();
     let data = load_backup(&bid)?;
-    restore_with_preview(&data, dry_run, assume_yes, "undo")
+    restore_with_preview(&data, assume_yes, opts, "undo")
 }
 
 fn restore_with_preview(
     data: &crate::types::Backup,
-    dry_run: bool,
     assume_yes: bool,
+    opts: RestoreOptions,
     verb: &str,
 ) -> Result<()> {
+    let dry_run = opts.dry_run;
     let stdout_tty = is_terminal::is_terminal(std::io::stdout());
     let g = glyphs();
 
@@ -570,7 +591,17 @@ fn restore_with_preview(
         }
     }
 
-    let errors = apply_restore(&data.entries, dry_run);
+    // Restore is a mutation like any other: it must respect `janitor lock`
+    // and hold the global lock so it cannot interleave with a concurrent
+    // grant/chmod that is halfway through its own backup.
+    let errors = with_lock(|| {
+        for e in &data.entries {
+            crate::locks::ensure_not_locked(&e.path)?;
+        }
+        let mut errors = apply_restore(&data.entries, opts);
+        errors += revert_account_changes(&data.operation, dry_run);
+        Ok(errors)
+    })?;
     if errors > 0 {
         return Err(PmError::Other(format!("{errors} error(s) during restore")));
     }
@@ -594,6 +625,48 @@ fn restore_with_preview(
         println!("backup: {}", data.id);
     }
     Ok(())
+}
+
+/// Undo the group membership and group creation a `grant` performed.
+///
+/// A grant is two things: file metadata and account bookkeeping. Restoring
+/// only the former left the user inside the managed group forever, so the
+/// access the grant handed out survived its own "full revert". Only changes
+/// this backup recorded making are undone, and `delete_managed_group`
+/// refuses anything that is not a `pm_` group.
+///
+/// Returns the number of failures, so they land in the restore error count.
+fn revert_account_changes(op: &crate::types::Operation, dry_run: bool) -> u32 {
+    let mut errors = 0u32;
+    let group = match &op.group {
+        Some(g) if op.user_added || op.group_created => g,
+        _ => return 0,
+    };
+    if op.user_added {
+        if let Some(u) = &op.user {
+            if dry_run {
+                println!("[dry-run] gpasswd -d {u} {group}");
+            } else if let Err(e) = remove_user_from_group(u, group, false) {
+                eprintln!("error removing {u} from {group}: {e}");
+                errors += 1;
+            }
+        }
+    }
+    if op.group_created {
+        if dry_run {
+            println!("[dry-run] groupdel {group}");
+        } else {
+            match crate::groups::delete_managed_group(group) {
+                Ok(true) => println!("removed group {group}"),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("error deleting group {group}: {e}");
+                    errors += 1;
+                }
+            }
+        }
+    }
+    errors
 }
 
 fn format_op_summary(op: &crate::types::Operation) -> String {
@@ -674,18 +747,22 @@ fn parse_since(s: &str) -> Result<chrono::Duration> {
     let n: i64 = num
         .parse()
         .map_err(|_| PmError::Other(format!("invalid --since: {s}")))?;
-    Ok(match unit {
-        "s" | "" => chrono::Duration::seconds(n),
-        "m" => chrono::Duration::minutes(n),
-        "h" => chrono::Duration::hours(n),
-        "d" => chrono::Duration::days(n),
-        "w" => chrono::Duration::weeks(n),
+    // The unchecked constructors panic on overflow, so `--since
+    // 9223372036854775807w` used to abort with exit 101 instead of a
+    // validation error.
+    let d = match unit {
+        "s" | "" => chrono::Duration::try_seconds(n),
+        "m" => chrono::Duration::try_minutes(n),
+        "h" => chrono::Duration::try_hours(n),
+        "d" => chrono::Duration::try_days(n),
+        "w" => chrono::Duration::try_weeks(n),
         other => {
             return Err(PmError::Other(format!(
                 "invalid --since unit `{other}` (use s/m/h/d/w)"
             )))
         }
-    })
+    };
+    d.ok_or_else(|| PmError::Other(format!("--since duration out of range: {s}")))
 }
 
 /// Print backup history for a path substring (newest first).
@@ -806,7 +883,7 @@ pub fn cmd_history(path: &str, since: Option<&str>, as_json: bool) -> Result<()>
 }
 
 pub fn cmd_lock(path: &str, reason: Option<&str>) -> Result<()> {
-    let p = resolve_path(path)?;
+    let p = resolve_path_nofollow(path)?;
     crate::locks::add(&p, reason)?;
     let g = glyphs();
     println!(
@@ -834,7 +911,7 @@ pub fn cmd_lock(path: &str, reason: Option<&str>) -> Result<()> {
 }
 
 pub fn cmd_unlock(path: &str) -> Result<()> {
-    let p = resolve_path(path)?;
+    let p = resolve_path_nofollow(path)?;
     crate::locks::remove(&p)?;
     let g = glyphs();
     println!(

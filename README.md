@@ -185,16 +185,16 @@ single-letter equivalent.
 |---|---|
 | `grant` (`g`) `PATH [-u USER\|-g GROUP] [-r] [-w] [-x] [-R]` | Hierarchical grant with auto-snapshot. |
 | `revoke` (`rv`) `PATH -u USER` | Remove user from the managed group (all-or-nothing). |
-| `restore` (`r`) `ID` | Full rollback of a specific backup. |
-| `undo` (`u`) | Restore the most recent backup (one-shot revert of the last change). |
+| `restore` (`r`) `ID [--yes] [--skip-missing] [--allow-replaced]` | Full rollback of a specific backup, including the group membership a `grant` created. Refuses entries whose file type or inode changed since the snapshot; `--allow-replaced` accepts a new inode (an editor rewrite) while still refusing a type change. `--skip-missing` tolerates paths that no longer exist. |
+| `undo` (`u`) `[--yes] [--skip-missing] [--allow-replaced]` | Restore the most recent backup (one-shot revert of the last change). |
 | `tree` (`t`) `PATH [-L DEPTH] [-U USER] [-A] [-c WHEN]` | Colored permission tree. |
 | `chmod MODE PATH... [-R] [-F FILE] [-E GLOB] [--from-file FILE] [--stdin0]` | Octal (inc. `4755`/`2755`/`1777`/`6755` special bits) or symbolic (`u+s`, `g+s`, `+t`, `a+X`, ...), with auto-snapshot. Accepts many PATHs in one call (single snapshot) and can stream them from a file or NUL-separated stdin. `--reference FILE` copies the mode from another path. |
 | `chown SPEC PATH... [-R] [-F FILE] [-E GLOB] [--from-file FILE] [--stdin0]` | `user`, `user:group`, `:group`, `user:`, numeric `1000:1000`. Symlinks are always `lchown`-ed. Same mass-path / exclude / stdin options as `chmod`. |
 | `info` (`i`) `PATH [-U USER]` | One-shot summary: type, owner, group, mode (octal + symbolic), setuid/setgid/sticky, size, mtime, symlink target, ACLs, optional effective access for a user. |
 | `history` (`h`) `PATH [--since DUR]` | Every backup whose target contains PATH, newest first. `--since 30m/1h/2d/1w` filters by age. Supports `--json`. |
 | `copy-perms` (`cp`) `SRC DST [-R] [-A] [-E GLOB]` | Atomically copy mode + owner + group (+ ACLs with `-A`) from SRC to DST, snapshotting DST first. |
-| `audit` (`a`) `PATH [-W] [-r] [-x] [-s] [-S] [-t] [-o USER] [-g GROUP] [-m MODE] [-A] [--no-owner] [--no-group] [-E GLOB] [--fix ACTION]` | Scan filters are AND-combined. `--fix ACTION` applies `chmod MODE` / `chown SPEC` / `preset NAME` / `strip-world-write` / `strip-setuid` / `strip-setgid` / `strip-sticky` to every match under one snapshot. |
-| `find-orphans PATH` | Files with UID/GID not in `/etc/passwd` or `/etc/group`. |
+| `audit` (`a`) `PATH [-W] [-r] [-x] [-s] [-S] [-t] [-o USER] [-g GROUP] [-m MODE] [-A] [--no-owner] [--no-group] [-E GLOB] [--fix ACTION] [--best-effort]` | Scan filters are AND-combined. `--fix ACTION` applies `chmod MODE` / `chown SPEC` / `preset NAME` / `strip-world-write` / `strip-setuid` / `strip-setgid` / `strip-sticky` to every match under one snapshot. Exits non-zero if part of the tree could not be read; `--best-effort` downgrades that to a warning. |
+| `find-orphans PATH [--best-effort]` | Files with UID/GID not in `/etc/passwd` or `/etc/group`. |
 | `who-can` (`w`) `PATH` | Reverse query: which users can read / write / exec. |
 | `diff ID` / `export ID` | Inspect a backup vs current / dump a backup as text or JSON. |
 | `acl grant\|revoke\|show\|strip PATH [-u USER\|-g GROUP] [-r] [-w] [-x] [-d] [-R]` | POSIX ACL management with snapshots. |
@@ -208,7 +208,7 @@ single-letter equivalent.
 | `lock PATH [-r REASON]` / `unlock PATH` / `locks` | Block all janitor mutations on PATH (and descendants if PATH is a directory). |
 | `policy apply\|verify FILE` | Declarative YAML policy: `rules: [{path, mode?, owner?, group?, preset?, recursive?, exclude?}]`. `verify` exits 1 on drift. |
 | `batch FILE` | Run many `chmod` / `chown` / `preset` ops in one transaction (one snapshot, one undo). Use `-` for stdin. |
-| `attr show\|set-immutable\|clear-immutable\|set-append-only\|clear-append-only PATH` | Wrapper around `chattr` / `lsattr`. |
+| `attr show\|set-immutable\|clear-immutable\|set-append-only\|clear-append-only PATH` | Wrapper around `chattr` / `lsattr`. Snapshotted and `--dry-run`-aware like every other mutation. |
 | `completions SHELL` | bash / zsh / fish / powershell / elvish. |
 
 **Global flags:** `-n, --dry-run`, `-j, --json` (where supported), `-h, --help`, `-V, --version`.
@@ -449,7 +449,13 @@ Every mutating command writes a MessagePack (`.mpk`) snapshot before it touches 
 ~/.local/share/janitor/backups/      # when run as a normal user
 ```
 
-Each snapshot contains mode, uid, gid, symlink-ness, and POSIX ACLs for every path it intends to modify (parents + target + recursive children). ACLs are always included by default; pass `--no-acl` to omit them. Restore is atomic per path:
+Each snapshot contains mode, uid, gid, symlink-ness, inode identity (`dev`/`ino`), and POSIX ACLs for every path it intends to modify (parents + target + recursive children). ACLs are always included by default; pass `--no-acl` to omit them.
+
+Snapshotting is fail-closed: if a path cannot be stat'ed, or its ACL cannot be read on a filesystem that supports ACLs, the command aborts rather than mutating on top of a backup that cannot undo it. A missing `acl` package is not a failure — those entries are flagged as "not captured" and the run warns once.
+
+Restore is atomic per path, and refuses any entry whose file type or inode no longer matches the snapshot, so a path swapped for a symlink or hard link since the backup cannot redirect the change to another file.
+
+An ordinary editor save is write-then-rename, which also produces a new inode, so `restore` after editing a file reports it as replaced. Pass `--allow-replaced` when that is what happened; the file-type check still applies, so the symlink case stays blocked either way.
 
 ```sh
 janitor list-backups                 # list available snapshots
@@ -465,7 +471,10 @@ Backups are never touched by `restore` itself, so you can re-apply or re-revert.
 ## Security notes
 
 - Parent directories receive only `--x` (traverse); they are never made world-readable.
-- Symlinks are never followed for ownership or mode changes; `lchown(2)` is used.
+- Symlinks are never followed for ownership or mode changes; `lchown(2)` is used. This applies to a symlink named directly on the command line too, which is where janitor deliberately differs from coreutils (`chmod`/`chown` dereference their operands).
+- `restore` refuses entries whose file type or inode changed since the snapshot, so a swapped path cannot redirect a privileged metadata write.
+- Backup ids are validated before use, so `restore` cannot be pointed at a payload outside the backup directory.
+- Scans that cannot read part of a tree exit non-zero instead of reporting no findings (`--best-effort` opts out).
 - Granting access to a world-readable file emits a warning, since in that state the grant is purely advisory.
 - The backup directory is `0700` to prevent snapshot leakage.
 - An advisory `flock` in the backup directory prevents concurrent mutations.

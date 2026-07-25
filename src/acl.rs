@@ -59,7 +59,11 @@ pub fn supports_acl(path: &Path) -> bool {
 }
 
 /// Get the access ACL of a path in canonical (compact) form.
-/// Returns None if ACL tooling not installed or only the base mode is present.
+///
+/// Returns `Ok(None)` when the ACL tooling is not installed or the path
+/// carries only its base mode. A `getfacl` that runs but *fails* is an
+/// error: silently turning it into "no ACL" would let a mutation proceed
+/// with a backup that cannot restore the original ACL.
 pub fn get_acl(path: &Path) -> Result<Option<String>> {
     if !acl_available() {
         return Ok(None);
@@ -71,7 +75,11 @@ pub fn get_acl(path: &Path) -> Result<Option<String>> {
         .output()
         .map_err(|e| PmError::Other(format!("getfacl failed: {e}")))?;
     if !out.status.success() {
-        return Ok(None);
+        return Err(PmError::Other(format!(
+            "getfacl {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let trimmed = text.trim();
@@ -93,7 +101,11 @@ pub fn get_default_acl(path: &Path) -> Result<Option<String>> {
         .output()
         .map_err(|e| PmError::Other(format!("getfacl -d failed: {e}")))?;
     if !out.status.success() {
-        return Ok(None);
+        return Err(PmError::Other(format!(
+            "getfacl -d {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     // Filter out lines that aren't actual ACL entries.
@@ -268,6 +280,43 @@ pub fn acl_strip(path: &Path, recursive: bool, dry_run: bool) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Canonical form of an ACL text for comparison.
+///
+/// `getfacl` output is not stable enough to diff as a string: it carries
+/// `# file:` headers, blank lines and `#effective:` annotations, and entry
+/// order is not guaranteed. Strip the commentary and sort what is left, so
+/// two ACLs compare equal exactly when they grant the same thing.
+pub fn normalize_acl(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.sort();
+    lines.dedup();
+    lines
+}
+
+/// True when two captured ACL texts describe different permissions.
+/// `None` and an ACL that normalizes to nothing are treated as equal.
+pub fn acl_text_differs(a: Option<&str>, b: Option<&str>) -> bool {
+    let na = a.map(normalize_acl).unwrap_or_default();
+    let nb = b.map(normalize_acl).unwrap_or_default();
+    na != nb
+}
+
+/// Read both ACLs of a path for comparison purposes.
+/// Returns `(access, default)`; unreadable ACLs come back as `None`.
+pub fn read_acl_pair(path: &Path) -> (Option<String>, Option<String>) {
+    let access = get_acl(path).ok().flatten();
+    let default = if path.is_dir() {
+        get_default_acl(path).ok().flatten()
+    } else {
+        None
+    };
+    (access, default)
 }
 
 /// Check if a path has any non-trivial ACL entries beyond the base mode.

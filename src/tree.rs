@@ -322,7 +322,10 @@ fn print_line(
     if mode & 0o1000 != 0 {
         counts.sticky += 1;
     }
-    if mode & 0o002 != 0 && !is_symlink && !is_dir {
+    // World-writable directories count too, matching `audit -W`. Only a
+    // sticky directory (/tmp and friends) is exempt: there the write bit is
+    // normal and does not let one user replace another's files.
+    if mode & 0o002 != 0 && !is_symlink && !(is_dir && mode & 0o1000 != 0) {
         counts.world_write += 1;
     }
     let acl_here = has_extended_acl(path);

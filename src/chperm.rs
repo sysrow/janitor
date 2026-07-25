@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use crate::backup::save_backup;
 use crate::errors::{PmError, Result};
-use crate::helpers::resolve_path;
+use crate::helpers::{resolve_path, resolve_path_nofollow};
 use crate::locking::with_lock;
 use crate::matcher::ExcludeSet;
+use crate::perms::lchown;
 use crate::render::{paint, summary_line, Style};
 use crate::snapshot::snapshot_with_acl;
 use crate::types::Operation;
@@ -17,6 +18,10 @@ use crate::users::{gid_to_name, lookup_group, lookup_user, uid_to_name};
 /// Resolve each input path, enforce `ensure_not_locked`, and expand to a flat
 /// list honoring `recursive` + `exclude`. Returns `(resolved_targets, paths)`.
 /// Fail-closed: any missing / locked path aborts before any mutation.
+///
+/// Operands are resolved with [`resolve_path_nofollow`], so a symlink named
+/// directly on the command line is operated on as a symlink and never
+/// dereferenced into its target.
 pub fn expand_targets(
     paths_in: &[String],
     recursive: bool,
@@ -25,14 +30,17 @@ pub fn expand_targets(
     let mut paths = Vec::new();
     let mut resolved_targets = Vec::new();
     for p in paths_in {
-        let t = resolve_path(p)?;
+        let t = resolve_path_nofollow(p)?;
         crate::locks::ensure_not_locked(&t)?;
         resolved_targets.push(t.clone());
         if exclude.is_excluded(&t) {
             continue;
         }
+        let is_dir = fs::symlink_metadata(&t)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         paths.push(t.clone());
-        if recursive && t.is_dir() {
+        if recursive && is_dir {
             for entry in walkdir::WalkDir::new(&t)
                 .min_depth(1)
                 .follow_links(false)
@@ -49,8 +57,25 @@ pub fn expand_targets(
     Ok((resolved_targets, paths))
 }
 
+/// Order paths deepest-first so children are chmod'ed before their parents.
+///
+/// `expand_targets` hands back a pre-order walk. Applying it in that order
+/// means a recursive tighten (`chmod 000 dir -R`) strips the traverse bit
+/// from the root and then fails on every descendant underneath it, leaving
+/// the tree half-changed. Post-order avoids that: by the time a directory
+/// loses its own permissions, everything below it is already done.
+///
+/// The walk itself already happened in `expand_targets`, so reordering here
+/// cannot affect which paths are visited.
+fn depth_first(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = paths.to_vec();
+    out.sort_by_key(|b| std::cmp::Reverse(b.components().count()));
+    out
+}
+
 /// Apply a chmod (octal or symbolic, or a fixed `ref_mode`) to each path in
 /// `paths`. Does NOT take a snapshot; the caller must record its own backup.
+/// Applies deepest paths first (see [`depth_first`]).
 /// Returns (changed, unchanged, failed) counts.
 pub fn apply_chmod_to_paths(
     paths: &[PathBuf],
@@ -61,7 +86,8 @@ pub fn apply_chmod_to_paths(
     let mut changed = 0usize;
     let mut unchanged = 0usize;
     let mut failed = 0usize;
-    for p in paths {
+    for p in depth_first(paths) {
+        let p = &p;
         let md = match fs::symlink_metadata(p) {
             Ok(m) => m,
             Err(_) => {
@@ -147,7 +173,8 @@ pub fn apply_chown_to_paths(
     let g_name = new_gid
         .map(|g| gid_to_name(Gid::from_raw(g)))
         .unwrap_or_else(|| "(keep)".into());
-    for p in paths {
+    for p in depth_first(paths) {
+        let p = &p;
         let before = fs::symlink_metadata(p).ok();
         let (bu, bg) = match &before {
             Some(m) => (
@@ -225,22 +252,6 @@ pub fn resolve_chown_target(
     }
 }
 
-/// lchown via libc: does NOT follow symlinks (unlike std::os::unix::fs::chown).
-fn lchown(path: &Path, uid: Option<u32>, gid: Option<u32>) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let u = uid.unwrap_or(u32::MAX); // -1 = don't change
-    let g = gid.unwrap_or(u32::MAX);
-    let ret = unsafe { libc::lchown(c_path.as_ptr(), u, g) };
-    if ret != 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 /// Parse an octal mode string like "755" or "0755" or "4755" into u32.
 pub fn parse_octal(s: &str) -> Result<u32> {
     let trimmed = s.trim_start_matches('0');
@@ -256,17 +267,45 @@ pub fn parse_octal(s: &str) -> Result<u32> {
         })
 }
 
+/// The process umask, read once.
+///
+/// There is no way to *read* the umask without setting it, so this does the
+/// standard set-and-restore dance. It runs from `main` before any file is
+/// created, and the result is cached, so no other thread can observe the
+/// momentary change.
+pub fn process_umask() -> u32 {
+    use nix::sys::stat::{umask, Mode};
+    use std::sync::OnceLock;
+    static UMASK: OnceLock<u32> = OnceLock::new();
+    *UMASK.get_or_init(|| {
+        let current = umask(Mode::from_bits_truncate(0o022));
+        umask(current);
+        current.bits() as u32 & 0o777
+    })
+}
+
 /// Apply symbolic mode like "u+r", "g-w", "o=rx", "a+X", "u+s".
 /// Returns the new mode given the current one.
 pub fn apply_symbolic(current: u32, spec: &str, is_dir: bool) -> Result<u32> {
+    apply_symbolic_with_umask(current, spec, is_dir, process_umask())
+}
+
+/// `apply_symbolic` with the umask supplied explicitly, so tests are not at
+/// the mercy of whatever umask the shell running them happened to have.
+pub fn apply_symbolic_with_umask(
+    current: u32,
+    spec: &str,
+    is_dir: bool,
+    umask: u32,
+) -> Result<u32> {
     let mut mode = current & 0o7777;
     for part in spec.split(',') {
-        mode = apply_one(mode, part.trim(), is_dir)?;
+        mode = apply_one(mode, part.trim(), is_dir, umask)?;
     }
     Ok(mode)
 }
 
-fn apply_one(mut mode: u32, spec: &str, is_dir: bool) -> Result<u32> {
+fn apply_one(mut mode: u32, spec: &str, is_dir: bool, umask: u32) -> Result<u32> {
     // Split into whos and op+perms.
     let op_pos = spec
         .find(|c: char| ['+', '-', '='].contains(&c))
@@ -276,7 +315,14 @@ fn apply_one(mut mode: u32, spec: &str, is_dir: bool) -> Result<u32> {
     let perms = &rest[1..];
 
     let mut who_mask: u32 = 0;
-    if whos.is_empty() || whos.contains('a') {
+    if whos.is_empty() {
+        // POSIX: with no `who`, the effect is as if `a` were given "except
+        // that bits in the file mode creation mask are not affected". So
+        // `umask 077; chmod +x f` sets only u+x, matching coreutils.
+        // An explicit `a` ignores the umask, which is the whole point of
+        // spelling it out.
+        who_mask |= 0o777 & !umask;
+    } else if whos.contains('a') {
         who_mask |= 0o700 | 0o070 | 0o007;
     } else {
         for c in whos.chars() {
@@ -384,7 +430,7 @@ pub fn cmd_chmod(
 
     with_lock(|| {
         if !dry_run {
-            let snap = snapshot_with_acl(&paths, capture_acl);
+            let snap = snapshot_with_acl(&paths, capture_acl)?;
             let target_str = resolved_targets
                 .iter()
                 .map(|p| p.display().to_string())
@@ -406,6 +452,8 @@ pub fn cmd_chmod(
                     max_level: None,
                     recursive: Some(recursive),
                     parent_op: None,
+                    group_created: false,
+                    user_added: false,
                 },
             )?;
             println!("backup: {bid}");
@@ -454,7 +502,7 @@ pub fn cmd_chown(
 
     with_lock(|| {
         if !dry_run {
-            let snap = snapshot_with_acl(&paths, capture_acl);
+            let snap = snapshot_with_acl(&paths, capture_acl)?;
             let target_str = resolved_targets
                 .iter()
                 .map(|p| p.display().to_string())
@@ -480,6 +528,8 @@ pub fn cmd_chown(
                     max_level: None,
                     recursive: Some(recursive),
                     parent_op: None,
+                    group_created: false,
+                    user_added: false,
                 },
             )?;
             println!("backup: {bid}");
@@ -552,8 +602,10 @@ pub fn cmd_copy_perms(
     dry_run: bool,
 ) -> Result<()> {
     use nix::unistd::{Gid, Uid};
+    // SRC is only read from, so its symlink is followed like `--reference`
+    // does. DST is mutated, so its final component stays un-dereferenced.
     let src_path = resolve_path(src)?;
-    let dst_path = resolve_path(dst)?;
+    let dst_path = resolve_path_nofollow(dst)?;
     crate::locks::ensure_not_locked(&dst_path)?;
     let src_md = fs::symlink_metadata(&src_path).map_err(|e| PmError::InsufficientPrivileges {
         path: src_path.clone(),
@@ -635,7 +687,7 @@ pub fn cmd_copy_perms(
     }
 
     with_lock(|| {
-        let snap_entries = snapshot_with_acl(&targets, include_acl);
+        let snap_entries = snapshot_with_acl(&targets, include_acl)?;
         let mut backup_id: Option<String> = None;
         if !dry_run {
             let bid = save_backup(
@@ -650,6 +702,8 @@ pub fn cmd_copy_perms(
                     max_level: None,
                     recursive: Some(recursive),
                     parent_op: None,
+                    group_created: false,
+                    user_added: false,
                 },
             )?;
             backup_id = Some(bid);
@@ -786,13 +840,34 @@ mod tests {
         assert_eq!(apply_symbolic(0o777, "o=", false).unwrap(), 0o770);
     }
 
+    /// POSIX: an omitted `who` behaves like `a` "except that bits in the
+    /// file mode creation mask are not affected". With umask 0 that is
+    /// literally a+x; with a real umask, coreutils drops the masked bits.
     #[test]
-    fn sym_empty_who_means_all() {
-        // "+x" (no who) adds x to all — equivalent to a+x
-        assert_eq!(apply_symbolic(0o644, "+x", false).unwrap(), 0o755);
-        // "=r" on 0o777 clears everything and sets read for all
-        // (also clears suid/sgid/sticky)
-        assert_eq!(apply_symbolic(0o7777, "=r", false).unwrap(), 0o444);
+    fn sym_empty_who_means_all_minus_umask() {
+        assert_eq!(
+            apply_symbolic_with_umask(0o644, "+x", false, 0o000).unwrap(),
+            0o755
+        );
+        assert_eq!(
+            apply_symbolic_with_umask(0o7777, "=r", false, 0o000).unwrap(),
+            0o444
+        );
+        // umask 077: only the owner triad is affected (the §M-07 case).
+        assert_eq!(
+            apply_symbolic_with_umask(0o600, "+x", false, 0o077).unwrap(),
+            0o700
+        );
+        // umask 022: group and other keep their write bits untouched.
+        assert_eq!(
+            apply_symbolic_with_umask(0o666, "-w", false, 0o022).unwrap(),
+            0o466
+        );
+        // An explicit `a` ignores the umask entirely.
+        assert_eq!(
+            apply_symbolic_with_umask(0o600, "a+x", false, 0o077).unwrap(),
+            0o711
+        );
     }
 
     #[test]

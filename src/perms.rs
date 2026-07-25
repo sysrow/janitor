@@ -1,16 +1,31 @@
 //! Low-level mode/owner mutations (raw `chmod`/`lchown`), with no snapshotting.
 
 use std::fs;
-use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use nix::unistd::{Gid, Uid};
 
-use crate::acl::restore_acl;
+use crate::acl::{acl_text_differs, read_acl_pair, restore_acl};
 use crate::errors::{PmError, Result};
 use crate::render::{paint, Style};
 use crate::types::{AccessBits, SnapEntry};
 use crate::users::{gid_to_name, lookup_group, uid_to_name};
+
+/// `lchown(2)`: change ownership without ever following a symlink, unlike
+/// `std::os::unix::fs::chown`. `None` leaves that id untouched.
+pub fn lchown(path: &Path, uid: Option<u32>, gid: Option<u32>) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let u = uid.unwrap_or(u32::MAX); // -1 = don't change
+    let g = gid.unwrap_or(u32::MAX);
+    if unsafe { libc::lchown(c_path.as_ptr(), u, g) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 /// Build a human-readable diff preview: current-vs-recorded lines. Skips
 /// entries whose live state already matches the snapshot.
@@ -35,7 +50,18 @@ pub fn preview_restore(entries: &[SnapEntry]) -> Vec<String> {
         let mode_diff = cur_mode != rec_mode && !e.is_symlink;
         let uid_diff = cur_uid != e.uid;
         let gid_diff = cur_gid != e.gid;
-        if !mode_diff && !uid_diff && !gid_diff {
+        // ACLs have to be part of the preview, not just of the apply. The
+        // caller gates its confirmation prompt (and its refusal to run
+        // unattended without --yes) on this list being non-empty, so an
+        // ACL-only restore used to slip through both.
+        let acl_diff = if e.acl.is_some() || e.default_acl.is_some() {
+            let (cur_acl, cur_default) = read_acl_pair(&e.path);
+            acl_text_differs(e.acl.as_deref(), cur_acl.as_deref())
+                || acl_text_differs(e.default_acl.as_deref(), cur_default.as_deref())
+        } else {
+            false
+        };
+        if !mode_diff && !uid_diff && !gid_diff && !acl_diff {
             continue;
         }
         let mut line = format!("  {}", paint(Style::Primary, &e.path.display().to_string()));
@@ -61,21 +87,110 @@ pub fn preview_restore(entries: &[SnapEntry]) -> Vec<String> {
                 paint(Style::Group, &rg)
             ));
         }
+        if acl_diff {
+            line.push_str(&format!(
+                "\n      acl    {}",
+                paint(Style::Label, "differs from snapshot")
+            ));
+        }
         out.push(line);
     }
     out
 }
 
+/// How strict `apply_restore` is about the state it finds on disk.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RestoreOptions {
+    pub dry_run: bool,
+    /// Report paths that vanished since the snapshot as skipped, not errors.
+    pub skip_missing: bool,
+    /// Accept an entry whose inode changed but whose file type still matches.
+    ///
+    /// The identity check exists to block a hard-link swap, but an ordinary
+    /// editor save is write-then-rename, which also produces a new inode. So
+    /// "I rewrote this file and now want my permissions back" and "someone
+    /// swapped this file under me" look identical from here. The default is
+    /// to refuse; this opts into the former reading.
+    pub allow_replaced: bool,
+}
+
+/// Describe why the live path no longer matches what the snapshot recorded.
+///
+/// Restoring metadata onto an entry that was swapped out since the snapshot
+/// was taken would apply the recorded mode/owner to whatever now sits at that
+/// path — a symlink or hard link planted by whoever controls the parent
+/// directory. Both are privilege-escalation primitives when janitor runs as
+/// root, so drift aborts that entry instead.
+fn entry_drift(entry: &SnapEntry, md: &fs::Metadata, allow_replaced: bool) -> Option<String> {
+    let now_symlink = md.file_type().is_symlink();
+    // The type check is never waived: it is what stops the recorded mode and
+    // owner from landing on a symlink's target.
+    if now_symlink != entry.is_symlink || (!now_symlink && md.is_dir() != entry.is_dir) {
+        return Some(format!(
+            "type changed since the snapshot ({} → {})",
+            kind_word(entry.is_symlink, entry.is_dir),
+            kind_word(now_symlink, md.is_dir())
+        ));
+    }
+    if allow_replaced {
+        return None;
+    }
+    // Backups written before identity capture store zeroes; there is nothing
+    // to compare against, so the type check above is all we can enforce.
+    if entry.dev == 0 && entry.ino == 0 {
+        return None;
+    }
+    if md.dev() != entry.dev || md.ino() != entry.ino {
+        return Some(
+            "inode changed since the snapshot (path was replaced; \
+             pass --allow-replaced if this was your own rewrite)"
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn kind_word(is_symlink: bool, is_dir: bool) -> &'static str {
+    if is_symlink {
+        "symlink"
+    } else if is_dir {
+        "directory"
+    } else {
+        "file"
+    }
+}
+
 /// Restore mode/uid/gid (and ACLs, if captured) from a snapshot.
+///
 /// Processes entries in reverse (leaves first) so that restoring a
 /// parent's stricter perms doesn't block access to children we still
 /// need to restore.
-pub fn apply_restore(entries: &[SnapEntry], dry_run: bool) -> u32 {
+///
+/// Entries whose live state no longer matches the snapshot are refused (see
+/// [`entry_drift`] and [`RestoreOptions`]).
+pub fn apply_restore(entries: &[SnapEntry], opts: RestoreOptions) -> u32 {
+    let dry_run = opts.dry_run;
     let mut errors = 0u32;
     for entry in entries.iter().rev() {
         let p = &entry.path;
-        if p.symlink_metadata().is_err() {
-            eprintln!("skip (missing): {}", p.display());
+        let md = match fs::symlink_metadata(p) {
+            Ok(m) => m,
+            Err(_) => {
+                if opts.skip_missing {
+                    eprintln!("skip (missing): {}", p.display());
+                } else {
+                    eprintln!(
+                        "error: {} is gone since the snapshot  (use --skip-missing to ignore)",
+                        p.display()
+                    );
+                    errors += 1;
+                }
+                continue;
+            }
+        };
+        if let Some(reason) = entry_drift(entry, &md, opts.allow_replaced) {
+            eprintln!("error: refusing to restore {}: {reason}", p.display());
+            errors += 1;
             continue;
         }
         let perm = entry.perm & 0o7777;
@@ -85,24 +200,9 @@ pub fn apply_restore(entries: &[SnapEntry], dry_run: bool) -> u32 {
         if entry.is_symlink {
             if dry_run {
                 // Preview already shows diffs; don't emit raw command lines.
-            } else {
-                // lchown: do NOT follow symlinks (unlike std::os::unix::fs::chown).
-                use std::ffi::CString;
-                use std::os::unix::ffi::OsStrExt;
-                let c_path = match CString::new(p.as_os_str().as_bytes()) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        eprintln!("error: invalid path (NUL byte): {}", p.display());
-                        errors += 1;
-                        continue;
-                    }
-                };
-                let ret = unsafe { libc::lchown(c_path.as_ptr(), uid, gid) };
-                if ret != 0 {
-                    let e = std::io::Error::last_os_error();
-                    eprintln!("error restoring ownership on {}: {e}", p.display());
-                    errors += 1;
-                }
+            } else if let Err(e) = lchown(p, Some(uid), Some(gid)) {
+                eprintln!("error restoring ownership on {}: {e}", p.display());
+                errors += 1;
             }
             continue;
         }
@@ -112,8 +212,11 @@ pub fn apply_restore(entries: &[SnapEntry], dry_run: bool) -> u32 {
         } else {
             let set_perms = || -> std::io::Result<()> {
                 // Ownership first: chown clears setuid/setgid, so the
-                // subsequent chmod re-applies them correctly.
-                chown(p, Some(uid), Some(gid))?;
+                // subsequent chmod re-applies them correctly. lchown is used
+                // even though the entry is not a symlink, so that a path
+                // swapped between the check above and here still cannot
+                // redirect the ownership change to another inode.
+                lchown(p, Some(uid), Some(gid))?;
                 fs::set_permissions(p, fs::Permissions::from_mode(perm))?;
                 // Rust's set_permissions may drop bits above 0o777 on
                 // some versions; re-apply via raw libc::chmod.
@@ -204,20 +307,181 @@ pub fn apply_group_bits(
     let gid = lookup_group(group)?.gid;
 
     // chgrp
-    chown(path, None::<u32>, Some(gid.as_raw())).map_err(|e| PmError::InsufficientPrivileges {
+    lchown(path, None, Some(gid.as_raw())).map_err(|e| PmError::InsufficientPrivileges {
         path: path.to_path_buf(),
         reason: e.to_string(),
     })?;
 
-    // chmod (only if changed)
-    if new_mode != current {
-        fs::set_permissions(path, fs::Permissions::from_mode(new_mode)).map_err(|e| {
-            PmError::InsufficientPrivileges {
+    // chmod unconditionally, even when new_mode == current. `new_mode` was
+    // computed from the mode read *before* the chgrp above, and chown clears
+    // setuid/setgid on executables — so skipping the chmod when nothing
+    // "changed" is exactly the case that silently drops those bits.
+    fs::set_permissions(path, fs::Permissions::from_mode(new_mode)).map_err(|e| {
+        PmError::InsufficientPrivileges {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        }
+    })?;
+    // set_permissions can drop bits above 0o777 on some std versions.
+    if new_mode & 0o7000 != 0 {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| PmError::Other(format!("invalid path: {e}")))?;
+        if unsafe { libc::chmod(c_path.as_ptr(), new_mode as libc::mode_t) } != 0 {
+            return Err(PmError::InsufficientPrivileges {
                 path: path.to_path_buf(),
-                reason: e.to_string(),
-            }
-        })?;
+                reason: std::io::Error::last_os_error().to_string(),
+            });
+        }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry_for(path: &Path) -> SnapEntry {
+        let md = fs::symlink_metadata(path).unwrap();
+        SnapEntry {
+            path: path.to_path_buf(),
+            mode: md.mode(),
+            perm: md.mode() & 0o7777,
+            uid: md.uid(),
+            gid: md.gid(),
+            is_symlink: md.file_type().is_symlink(),
+            is_dir: md.is_dir(),
+            dev: md.dev(),
+            ino: md.ino(),
+            acl: None,
+            default_acl: None,
+            acl_unavailable: false,
+            attrs: None,
+        }
+    }
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p =
+                std::env::temp_dir().join(format!("janitor-perms-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            Scratch(p.canonicalize().unwrap())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn drift_none_when_inode_unchanged() {
+        let s = Scratch::new("same");
+        let f = s.0.join("f");
+        fs::write(&f, b"x").unwrap();
+        let e = entry_for(&f);
+        assert!(entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), false).is_none());
+    }
+
+    /// §C-01: the recorded file was swapped for a symlink. Restoring would
+    /// chown/chmod whatever the link points at, so it must be refused.
+    #[test]
+    fn drift_detects_file_replaced_by_symlink() {
+        let s = Scratch::new("swap");
+        let f = s.0.join("f");
+        fs::write(&f, b"x").unwrap();
+        let e = entry_for(&f);
+
+        fs::remove_file(&f).unwrap();
+        std::os::unix::fs::symlink(s.0.join("victim"), &f).unwrap();
+
+        let drift = entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), false);
+        assert!(drift.unwrap().contains("type changed"));
+    }
+
+    /// Same type, different inode: a hard link swap is just as exploitable
+    /// as a symlink swap when janitor runs as root.
+    #[test]
+    fn drift_detects_replaced_inode() {
+        let s = Scratch::new("relink");
+        let f = s.0.join("f");
+        fs::write(&f, b"x").unwrap();
+        let e = entry_for(&f);
+        replace_with_fresh_inode(&s.0, &f);
+
+        let drift = entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), false);
+        assert!(drift.unwrap().contains("inode changed"));
+    }
+
+    /// Rename a *concurrently existing* file over `f`, so the replacement is
+    /// guaranteed a different inode number (a plain remove+create often
+    /// recycles the just-freed one on tmpfs).
+    fn replace_with_fresh_inode(dir: &Path, f: &Path) {
+        let other = dir.join("other");
+        fs::write(&other, b"y").unwrap();
+        fs::remove_file(f).unwrap();
+        fs::rename(&other, f).unwrap();
+    }
+
+    /// Backups written before identity capture carry zeroes; those must
+    /// still restore, guarded by the file-type check alone.
+    #[test]
+    fn drift_skips_identity_check_for_legacy_entries() {
+        let s = Scratch::new("legacy");
+        let f = s.0.join("f");
+        fs::write(&f, b"x").unwrap();
+        let mut e = entry_for(&f);
+        e.dev = 0;
+        e.ino = 0;
+        replace_with_fresh_inode(&s.0, &f);
+
+        assert!(entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), false).is_none());
+    }
+
+    /// `--allow-replaced` waives the inode check for the editor-rewrite case.
+    #[test]
+    fn allow_replaced_accepts_a_new_inode() {
+        let s = Scratch::new("allow");
+        let f = s.0.join("f");
+        fs::write(&f, b"x").unwrap();
+        let e = entry_for(&f);
+        replace_with_fresh_inode(&s.0, &f);
+
+        assert!(entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), true).is_none());
+    }
+
+    /// It must NOT waive the type check — that is what stops §C-01.
+    #[test]
+    fn allow_replaced_still_refuses_a_symlink_swap() {
+        let s = Scratch::new("allow-swap");
+        let f = s.0.join("f");
+        fs::write(&f, b"x").unwrap();
+        let e = entry_for(&f);
+
+        fs::remove_file(&f).unwrap();
+        std::os::unix::fs::symlink(s.0.join("victim"), &f).unwrap();
+
+        let drift = entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), true);
+        assert!(drift.unwrap().contains("type changed"));
+    }
+
+    #[test]
+    fn drift_detects_file_replaced_by_directory() {
+        let s = Scratch::new("dir");
+        let f = s.0.join("f");
+        fs::write(&f, b"x").unwrap();
+        let e = entry_for(&f);
+
+        fs::remove_file(&f).unwrap();
+        fs::create_dir(&f).unwrap();
+
+        let drift = entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), false);
+        assert!(drift.unwrap().contains("type changed"));
+    }
 }

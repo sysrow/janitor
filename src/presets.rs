@@ -198,7 +198,9 @@ pub fn cmd_apply_preset(
         );
         println!("  {}", paint(Style::Label, preset.2));
     }
-    cmd_chmod(preset.1, paths, recursive, false, None, exclude, dry_run)
+    // A preset is a chmod, and chmod rewrites the ACL mask -- capture ACLs so
+    // `undo` can put the original effective permissions back.
+    cmd_chmod(preset.1, paths, recursive, true, None, exclude, dry_run)
 }
 
 /// Look up a preset by name and return its octal mode string.

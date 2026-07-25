@@ -24,25 +24,69 @@ pub fn parse_access(s: &str) -> Result<AccessBits> {
     Ok(AccessBits(bits))
 }
 
-/// Resolve a path: expand `~`, canonicalize, fail if missing.
+/// Expand a leading `~` into `$HOME` (falling back to `/root`).
+fn expand_tilde(p: &str) -> PathBuf {
+    if p.starts_with('~') {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        PathBuf::from(p.replacen('~', &home, 1))
+    } else {
+        PathBuf::from(p)
+    }
+}
+
+/// `canonicalize` with janitor's error mapping.
 ///
 /// Distinguishes ENOENT ("does not exist") from EACCES ("exists but
 /// you lack search permission on a parent") — conflating them gives
 /// misleading errors when running unprivileged against paths whose
 /// ancestors are mode 700 for someone else.
-pub fn resolve_path(p: &str) -> Result<PathBuf> {
-    let expanded = if p.starts_with('~') {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-        PathBuf::from(p.replacen('~', &home, 1))
-    } else {
-        PathBuf::from(p)
-    };
-    match expanded.canonicalize() {
-        Ok(p) => Ok(p),
+fn canonicalize_checked(p: &Path) -> Result<PathBuf> {
+    match p.canonicalize() {
+        Ok(c) => Ok(c),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            Err(PmError::PathInaccessible(expanded))
+            Err(PmError::PathInaccessible(p.to_path_buf()))
         }
-        Err(_) => Err(PmError::PathNotFound(expanded)),
+        Err(_) => Err(PmError::PathNotFound(p.to_path_buf())),
+    }
+}
+
+/// Resolve a path: expand `~`, canonicalize, fail if missing.
+///
+/// Dereferences the whole path, including a symlink in the final
+/// component. Use this for read-only inspection (`info`, `audit`,
+/// `tree`, `--reference` sources); mutating commands must use
+/// [`resolve_path_nofollow`] instead.
+pub fn resolve_path(p: &str) -> Result<PathBuf> {
+    canonicalize_checked(&expand_tilde(p))
+}
+
+/// Resolve a path without dereferencing its final component.
+///
+/// The parent directory is canonicalized — so `..`, relative paths and
+/// symlinked *ancestors* are still normalized — but the last component is
+/// kept verbatim. Every mutating command resolves its operands this way so
+/// that `janitor chown u:g link` acts on the symlink itself, matching the
+/// `lchown(2)` semantics documented in the README ("symlinks are never
+/// followed for ownership or mode changes").
+pub fn resolve_path_nofollow(p: &str) -> Result<PathBuf> {
+    let expanded = expand_tilde(p);
+    // `/`, `.` and `..` have no distinct final component to preserve;
+    // there is no symlink to protect either, so canonicalize outright.
+    let file_name = match expanded.file_name() {
+        Some(f) => f.to_os_string(),
+        None => return canonicalize_checked(&expanded),
+    };
+    let parent = match expanded.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let resolved = canonicalize_checked(&parent)?.join(file_name);
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(_) => Ok(resolved),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(PmError::PathInaccessible(resolved))
+        }
+        Err(_) => Err(PmError::PathNotFound(resolved)),
     }
 }
 
@@ -224,6 +268,22 @@ pub fn is_pseudo_fs(path: &Path) -> bool {
     PSEUDO_FS_MAGIC.contains(&fs_type)
 }
 
+/// Render bytes as `\xNN` escapes so an undecodable path can at least be
+/// named in an error message.
+fn hex_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(64)
+        .map(|b| {
+            if b.is_ascii_graphic() || *b == b'/' {
+                (*b as char).to_string()
+            } else {
+                format!("\\x{b:02x}")
+            }
+        })
+        .collect()
+}
+
 /// Read extra paths from stdin (NUL-separated if `stdin0`) and/or a file
 /// (newline-separated; `-` means stdin). Extends `base` with them.
 pub fn read_extra_paths(
@@ -241,7 +301,17 @@ pub fn read_extra_paths(
             if chunk.is_empty() {
                 continue;
             }
-            base.push(String::from_utf8_lossy(chunk).to_string());
+            // `from_utf8_lossy` would replace the undecodable bytes with
+            // U+FFFD and hand back a path that names a *different* file (or
+            // none). For a tool that then chmods whatever it was given,
+            // guessing is the wrong answer — refuse instead.
+            let s = std::str::from_utf8(chunk).map_err(|_| {
+                PmError::Other(format!(
+                    "--stdin0: path is not valid UTF-8 and cannot be handled safely: {}",
+                    hex_preview(chunk)
+                ))
+            })?;
+            base.push(s.to_string());
         }
     }
     if let Some(f) = from_file {
@@ -278,6 +348,72 @@ mod tests {
         assert!(parse_access("").is_err());
         assert!(parse_access("z").is_err());
         assert!(parse_access("rz").is_err());
+    }
+
+    /// Scratch directory unique to one test, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("janitor-test-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Scratch(p.canonicalize().unwrap())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The whole point of `resolve_path_nofollow`: a symlink named as the
+    /// final component stays the symlink (§H-01), while `resolve_path`
+    /// dereferences it.
+    #[test]
+    fn nofollow_keeps_final_symlink_component() {
+        let s = Scratch::new("nofollow");
+        let target = s.0.join("target.txt");
+        std::fs::write(&target, b"x").unwrap();
+        let link = s.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let followed = resolve_path(link.to_str().unwrap()).unwrap();
+        let kept = resolve_path_nofollow(link.to_str().unwrap()).unwrap();
+
+        assert_eq!(followed, target);
+        assert_eq!(kept, link);
+    }
+
+    /// Symlinked *ancestors* must still be normalized — only the last
+    /// component is preserved verbatim.
+    #[test]
+    fn nofollow_still_canonicalizes_parents() {
+        let s = Scratch::new("nofollow-parent");
+        let real_dir = s.0.join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(real_dir.join("f.txt"), b"x").unwrap();
+        let dir_link = s.0.join("dirlink");
+        std::os::unix::fs::symlink(&real_dir, &dir_link).unwrap();
+
+        let resolved = resolve_path_nofollow(dir_link.join("f.txt").to_str().unwrap()).unwrap();
+        assert_eq!(resolved, real_dir.join("f.txt"));
+    }
+
+    /// A path with no distinct final component falls back to full
+    /// canonicalization rather than erroring out.
+    #[test]
+    fn nofollow_handles_root_and_dot_dot() {
+        assert_eq!(resolve_path_nofollow("/").unwrap(), PathBuf::from("/"));
+        assert!(resolve_path_nofollow("/..").is_ok());
+    }
+
+    #[test]
+    fn nofollow_reports_missing_paths() {
+        let s = Scratch::new("nofollow-missing");
+        let missing = s.0.join("not-here");
+        assert!(resolve_path_nofollow(missing.to_str().unwrap()).is_err());
     }
 
     #[test]

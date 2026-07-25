@@ -51,6 +51,31 @@ pub fn add_user_to_group(user: &str, group: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// Delete a group created by an earlier `grant`.
+///
+/// Only `pm_`-prefixed groups are eligible: restore must never delete a
+/// pre-existing system group just because a grant happened to use it.
+/// Returns Ok(true) if the group was deleted.
+pub fn delete_managed_group(name: &str) -> Result<bool> {
+    if !name.starts_with("pm_") {
+        return Ok(false);
+    }
+    if !group_exists(name) {
+        return Ok(false);
+    }
+    let status = Command::new("/usr/sbin/groupdel")
+        .arg(name)
+        .status()
+        .map_err(|e| PmError::GroupMembershipFailed(format!("`groupdel` failed: {e}")))?;
+    if !status.success() {
+        return Err(PmError::GroupMembershipFailed(format!(
+            "could not delete group {name} (exit {})",
+            status.code().unwrap_or(-1)
+        )));
+    }
+    Ok(true)
+}
+
 /// Remove user from group. Returns Ok(true) if removed, Ok(false) if no-op.
 pub fn remove_user_from_group(user: &str, group: &str, dry_run: bool) -> Result<bool> {
     if !group_exists(group) {

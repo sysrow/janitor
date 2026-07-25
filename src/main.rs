@@ -73,6 +73,11 @@ fn main() {
     })
     .ok();
 
+    // Cache the umask before anything creates a file. Reading it requires
+    // temporarily setting it, so this has to happen while we are still
+    // single-threaded and have not touched the filesystem.
+    chperm::process_umask();
+
     let cli = Cli::parse();
     // Presentation layer init. Color respects --color on commands that
     // carry it (currently `tree`), otherwise follows autodetect (NO_COLOR,
@@ -145,8 +150,32 @@ fn run(cli: Cli) -> errors::Result<()> {
             recursive,
             no_acl,
         } => commands::cmd_backup(&path, recursive, !no_acl),
-        Command::Restore { backup_id, yes } => commands::cmd_restore(&backup_id, dry_run, yes),
-        Command::Undo { yes } => commands::cmd_undo(dry_run, yes),
+        Command::Restore {
+            backup_id,
+            yes,
+            skip_missing,
+            allow_replaced,
+        } => commands::cmd_restore(
+            &backup_id,
+            yes,
+            perms::RestoreOptions {
+                dry_run,
+                skip_missing,
+                allow_replaced,
+            },
+        ),
+        Command::Undo {
+            yes,
+            skip_missing,
+            allow_replaced,
+        } => commands::cmd_undo(
+            yes,
+            perms::RestoreOptions {
+                dry_run,
+                skip_missing,
+                allow_replaced,
+            },
+        ),
         Command::History { path, since } => commands::cmd_history(&path, since.as_deref(), json),
         Command::CopyPerms {
             src,
@@ -230,6 +259,7 @@ fn run(cli: Cli) -> errors::Result<()> {
             fix,
             paths,
             print0,
+            best_effort,
         } => {
             let mode_num = match mode {
                 Some(s) => Some(chperm::parse_octal(&s)?),
@@ -253,16 +283,32 @@ fn run(cli: Cli) -> errors::Result<()> {
             };
             let ex = matcher::ExcludeSet::new(&exclude)?;
             match fix {
-                Some(action) => {
-                    audit::cmd_audit_fix(&path, &filter, &ex, &action, dry_run, include_pseudo)
-                }
-                None => audit::cmd_audit(&path, &filter, &ex, json, include_pseudo, paths, print0),
+                Some(action) => audit::cmd_audit_fix(
+                    &path,
+                    &filter,
+                    &ex,
+                    &action,
+                    dry_run,
+                    include_pseudo,
+                    best_effort,
+                ),
+                None => audit::cmd_audit(
+                    &path,
+                    &filter,
+                    &ex,
+                    json,
+                    include_pseudo,
+                    paths,
+                    print0,
+                    best_effort,
+                ),
             }
         }
         Command::FindOrphans {
             path,
             include_pseudo,
-        } => audit::cmd_find_orphans(&path, json, include_pseudo),
+            best_effort,
+        } => audit::cmd_find_orphans(&path, json, include_pseudo, best_effort),
         Command::WhoCan { path } => whocan::cmd_who_can(&path, json),
         Command::Info { path, for_user } => info::cmd_info(&path, for_user.as_deref()),
         Command::Acl(sub) => match sub {
@@ -348,10 +394,10 @@ fn run(cli: Cli) -> errors::Result<()> {
         Command::Batch { file } => batch::cmd_batch(&file, dry_run),
         Command::Attr(sub) => match sub {
             AttrCmd::Show { path } => attr::cmd_attr_show(&path),
-            AttrCmd::SetImmutable { path } => attr::cmd_attr_set_immutable(&path),
-            AttrCmd::ClearImmutable { path } => attr::cmd_attr_clear_immutable(&path),
-            AttrCmd::SetAppendOnly { path } => attr::cmd_attr_set_append(&path),
-            AttrCmd::ClearAppendOnly { path } => attr::cmd_attr_clear_append(&path),
+            AttrCmd::SetImmutable { path } => attr::cmd_attr_set_immutable(&path, dry_run),
+            AttrCmd::ClearImmutable { path } => attr::cmd_attr_clear_immutable(&path, dry_run),
+            AttrCmd::SetAppendOnly { path } => attr::cmd_attr_set_append(&path, dry_run),
+            AttrCmd::ClearAppendOnly { path } => attr::cmd_attr_clear_append(&path, dry_run),
         },
         Command::Completions { shell } => completions::cmd_completions(shell),
         Command::Man => completions::cmd_man(),

@@ -1,4 +1,8 @@
 /target
 /dist
+/test-results
 *.swp
 .DS_Store
+
+# Local test host inventory — addresses must never be committed.
+/tests/hosts.env

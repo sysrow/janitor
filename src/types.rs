@@ -17,12 +17,27 @@ pub struct SnapEntry {
     pub gid: u32,
     pub is_symlink: bool,
     pub is_dir: bool,
+    /// `st_dev` of the captured inode. Zero in backups written before
+    /// identity checking existed, which restore treats as "unknown".
+    #[serde(default)]
+    pub dev: u64,
+    /// `st_ino` of the captured inode. Zero means "unknown" (see `dev`).
+    #[serde(default)]
+    pub ino: u64,
     /// Raw ACL text (as produced by `getfacl -c`). None if ACLs not captured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acl: Option<String>,
     /// Raw default ACL text (directories only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_acl: Option<String>,
+    /// ACL capture was requested but could not be performed — the tooling is
+    /// missing or the filesystem has no ACL support. Distinct from `acl:
+    /// None`, which means "captured, and there was nothing to record".
+    #[serde(default)]
+    pub acl_unavailable: bool,
+    /// Raw `lsattr -d` output, captured only by the `attr` command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attrs: Option<String>,
 }
 
 /// Serialize PathBuf as raw bytes (OsStr) so non-UTF-8 filenames survive.
@@ -79,6 +94,12 @@ pub struct Operation {
     pub recursive: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_op: Option<String>,
+    /// The operation created `group`; restore deletes it again.
+    #[serde(default)]
+    pub group_created: bool,
+    /// The operation added `user` to `group`; restore removes the membership.
+    #[serde(default)]
+    pub user_added: bool,
 }
 
 /// Complete backup payload stored as JSON.
