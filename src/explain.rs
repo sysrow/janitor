@@ -390,14 +390,22 @@ fn suggest_fixes(
     target_d: &crate::access::AccessDecision,
     traversable: bool,
 ) -> (Vec<String>, &'static str) {
+    // These are meant to be copy-pasted, so they must match the actual CLI:
+    // `grant` takes PATH positionally with -u/-a flags, not `USER PERM PATH`.
     let mut hints = Vec::new();
     if let Some(b) = blocker {
-        hints.push(format!("janitor grant {username} rx {}", b.display()));
+        hints.push(format!("janitor grant {} -u {username} -a rx", b.display()));
         if !target_d.read {
-            hints.push(format!("janitor grant {username} r  {}", target.display()));
+            hints.push(format!(
+                "janitor grant {} -u {username} -a r",
+                target.display()
+            ));
         }
     } else if traversable && !target_d.read {
-        hints.push(format!("janitor grant {username} r {}", target.display()));
+        hints.push(format!(
+            "janitor grant {} -u {username} -a r",
+            target.display()
+        ));
     }
     (hints, "try:")
 }

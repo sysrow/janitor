@@ -54,6 +54,7 @@ pub fn snapshot_with_acl(paths: &[impl AsRef<Path>], capture_acl: bool) -> Resul
             acl,
             default_acl,
             acl_unavailable,
+            attrs: None,
         });
     }
     Ok(out)

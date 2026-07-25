@@ -35,6 +35,9 @@ pub struct SnapEntry {
     /// None`, which means "captured, and there was nothing to record".
     #[serde(default)]
     pub acl_unavailable: bool,
+    /// Raw `lsattr -d` output, captured only by the `attr` command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attrs: Option<String>,
 }
 
 /// Serialize PathBuf as raw bytes (OsStr) so non-UTF-8 filenames survive.

@@ -752,18 +752,22 @@ fn parse_since(s: &str) -> Result<chrono::Duration> {
     let n: i64 = num
         .parse()
         .map_err(|_| PmError::Other(format!("invalid --since: {s}")))?;
-    Ok(match unit {
-        "s" | "" => chrono::Duration::seconds(n),
-        "m" => chrono::Duration::minutes(n),
-        "h" => chrono::Duration::hours(n),
-        "d" => chrono::Duration::days(n),
-        "w" => chrono::Duration::weeks(n),
+    // The unchecked constructors panic on overflow, so `--since
+    // 9223372036854775807w` used to abort with exit 101 instead of a
+    // validation error.
+    let d = match unit {
+        "s" | "" => chrono::Duration::try_seconds(n),
+        "m" => chrono::Duration::try_minutes(n),
+        "h" => chrono::Duration::try_hours(n),
+        "d" => chrono::Duration::try_days(n),
+        "w" => chrono::Duration::try_weeks(n),
         other => {
             return Err(PmError::Other(format!(
                 "invalid --since unit `{other}` (use s/m/h/d/w)"
             )))
         }
-    })
+    };
+    d.ok_or_else(|| PmError::Other(format!("--since duration out of range: {s}")))
 }
 
 /// Print backup history for a path substring (newest first).

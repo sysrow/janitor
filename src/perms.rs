@@ -339,6 +339,7 @@ mod tests {
             acl: None,
             default_acl: None,
             acl_unavailable: false,
+            attrs: None,
         }
     }
 

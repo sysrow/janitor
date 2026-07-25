@@ -50,16 +50,21 @@ fn group_name(gid: u32) -> (String, bool) {
 }
 
 /// Absolute ISO-8601 UTC plus a relative hint ("3d ago").
+///
+/// `st_mtime` is signed: pre-1970 timestamps are negative and casting them
+/// to u64 turned them into dates tens of billions of years in the future.
 fn format_mtime(md: &fs::Metadata) -> String {
-    let secs = md.mtime() as u64;
-    let (y, mo, d, h, mi) = unix_to_ymdhm(secs);
-    let abs = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02} UTC");
+    let secs = md.mtime();
+    let abs = match chrono::DateTime::from_timestamp(secs, 0) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+        None => format!("(timestamp out of range: {secs})"),
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_secs() as i64)
         .unwrap_or(secs);
     let rel = if now > secs {
-        humanize_age(now - secs)
+        humanize_age((now - secs) as u64)
     } else {
         "just now".to_string()
     };
