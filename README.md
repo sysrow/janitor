@@ -24,6 +24,7 @@ No runtime dependencies beyond a Linux kernel and (for the `acl` subcommand) the
 - [Presets](#presets)
 - [JSON output](#json-output)
 - [Backup & restore](#backup--restore)
+- [Upgrading from 0.1.5](#upgrading-from-015)
 - [Security notes](#security-notes)
 - [Building from source](#building-from-source)
 - [Testing](#testing)
@@ -467,6 +468,35 @@ janitor prune-backups --keep 50      # keep last 50 snapshots
 Backups are never touched by `restore` itself, so you can re-apply or re-revert.
 
 ---
+
+## Upgrading from 0.1.5
+
+0.1.6 and 0.1.7 changed behaviour in ways an existing script can notice.
+Nothing here is a silent change — each one either errors out or produces a
+visibly different mode — but this is the list to check before rolling out.
+
+**Act on this one first.** Every release before 0.1.7 that has `seal`
+(0.1.4, 0.1.5, 0.1.6) granted each pinhole principal traversal across
+*every* pinhole's parent chain, not just its own. If you sealed a tree with
+more than one `--allow`, principals hold `--x` on branches they were never
+meant to reach:
+
+```sh
+getfacl -R /your/sealed/base | grep -B3 ':--x'   # look for foreign principals
+janitor seal /your/sealed/base -B ... --allow ...  # re-seal on 0.1.7 to clear
+```
+
+| Change | What to check |
+|---|---|
+| A symlink named directly as a `chmod` / `chown` operand is no longer dereferenced | Scripts that ran `janitor chown user path` where `path` is a symlink now change the link, not its target. This matches what the README and man page always documented, and differs from coreutils. |
+| Symbolic modes with no `who` honour the umask | `janitor chmod +x f` under `umask 077` now gives `0700`, not `0711`. Write `a+x` to get the old, umask-ignoring behaviour. |
+| `restore` / `undo` fail on missing paths | Add `--skip-missing` to restore the old silent-skip behaviour. |
+| `restore` / `undo` refuse entries whose inode changed | An editor rewrite (write-then-rename) trips this. Add `--allow-replaced`; the file-type check still applies. |
+| `audit` / `find-orphans` fail on unreadable subtrees | Add `--best-effort` to keep exit 0 on a partial scan. |
+| A `getfacl` failure aborts the command | Only when the filesystem supports ACLs and the read fails anyway. A missing `acl` package is still not an error. |
+
+Backups written by older versions still restore: they carry no inode
+identity, so those entries fall back to the file-type check alone.
 
 ## Security notes
 

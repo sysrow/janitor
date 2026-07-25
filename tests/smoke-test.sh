@@ -619,6 +619,31 @@ if command -v setfacl > /dev/null 2>&1 && getent passwd daemon > /dev/null 2>&1;
     rm -rf "$SEAL_ISO"
 fi
 
+# ── 28e5. a getfacl that runs and fails aborts the mutation (§H-04) ───
+# Distinct from "getfacl is not installed", which is NOT an error: that
+# case is flagged in the snapshot and warned about once. This covers the
+# other branch — the tooling is there, the filesystem supports ACLs, and
+# the read fails anyway. Faking it means replacing the binary, so this
+# only runs inside the disposable test container.
+if [[ -f /.dockerenv || -f /run/.containerenv ]] && [[ "$(id -u)" -eq 0 ]] && [[ -x /usr/bin/getfacl ]]; then
+    mkdir -p "$ROOT/aclfail"
+    echo x > "$ROOT/aclfail/f"
+    chmod 0644 "$ROOT/aclfail/f"
+    cp -a /usr/bin/getfacl /usr/bin/getfacl.janitor-backup
+    printf '#!/bin/sh\necho "simulated getfacl failure" >&2\nexit 1\n' > /usr/bin/getfacl
+    chmod 0755 /usr/bin/getfacl
+    if $JAN chmod 0600 "$ROOT/aclfail/f" > /dev/null 2>&1; then
+        ACLFAIL_RESULT=proceeded
+    else
+        ACLFAIL_RESULT=aborted
+    fi
+    ACLFAIL_MODE=$(stat -c '%a' "$ROOT/aclfail/f")
+    mv -f /usr/bin/getfacl.janitor-backup /usr/bin/getfacl
+    if [[ "$ACLFAIL_RESULT" == "aborted" ]]; then pass "snapshot aborts when getfacl fails"; else fail "snapshot proceeded despite getfacl failing"; fi
+    if [[ "$ACLFAIL_MODE" == "644" ]]; then pass "file untouched when the snapshot aborted"; else fail "file changed to $ACLFAIL_MODE despite a failed snapshot"; fi
+    rm -rf "$ROOT/aclfail"
+fi
+
 # ── 28f. grant on / is rejected, not a panic (§M-08) ──────────────────
 $JAN --dry-run grant / -u "$USER" -r --no-acl > /dev/null 2>&1
 GRANT_ROOT_RC=$?

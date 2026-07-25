@@ -9,7 +9,6 @@
 //! reads/writes ACLs.
 
 use std::collections::HashSet;
-use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 
 use crate::acl::{get_acl, has_extended_acl};
@@ -27,11 +26,10 @@ pub struct AccessDecision {
     pub reason: String,
 }
 
-/// Evaluate effective (r, w, x) for `username` on a single inode described
-/// by `md`.
+/// Evaluate effective (r, w, x) for `username` on `path`.
 ///
 /// The algorithm follows POSIX.1e §23.4.5:
-/// 1. Superuser (uid 0) gets r+w. Execute only if any `x` bit set or
+/// 1. Superuser (uid 0) gets r+w. Execute only if any `x` bit is set, or
 ///    if the inode is a directory.
 /// 2. Owner (uid == file uid) uses `ACL_USER_OBJ` (== owner triad), **no
 ///    mask** applied.
@@ -44,81 +42,11 @@ pub struct AccessDecision {
 /// 5. Else `ACL_OTHER` (== other triad).
 ///
 /// If the file has no extended ACL, steps 3-5 collapse to the standard
-/// group/other triads (no mask since no mask entry exists).
-pub fn effective_for_user(md: &Metadata, username: &str) -> Result<AccessDecision> {
-    let u = lookup_user(username)?;
-    let uid = u.uid.as_raw();
-    let gids: HashSet<u32> = user_gids(username)?
-        .into_iter()
-        .map(|g| g.as_raw())
-        .collect();
-
-    let mode = md.mode() & 0o7777;
-    let is_dir = md.is_dir();
-
-    // Rule 1: superuser.
-    if uid == 0 {
-        return Ok(AccessDecision {
-            read: true,
-            write: true,
-            exec: is_dir || (mode & 0o111 != 0),
-            reason: "root (superuser)".into(),
-        });
-    }
-
-    // Rule 2: owner. Owner entry ignores the mask.
-    if uid == md.uid() {
-        return Ok(AccessDecision {
-            read: mode & 0o400 != 0,
-            write: mode & 0o200 != 0,
-            exec: mode & 0o100 != 0,
-            reason: "owner".into(),
-        });
-    }
-
-    let file_path_opt = resolve_acl_path(md);
-    let acl_text = match file_path_opt.as_ref() {
-        Some(p) if has_extended_acl(p) => get_acl(p).unwrap_or(None),
-        _ => None,
-    };
-
-    if let Some(text) = acl_text {
-        if let Some(decision) = evaluate_acl(&text, uid, &gids, md.gid(), username) {
-            return Ok(decision);
-        }
-        // fall through if parse failed → POSIX triads
-    }
-
-    // Rule 4 (no-ACL fallback) / 5: classic triads.
-    let group_match = gids.contains(&md.gid());
-    if group_match {
-        Ok(AccessDecision {
-            read: mode & 0o040 != 0,
-            write: mode & 0o020 != 0,
-            exec: mode & 0o010 != 0,
-            reason: "group member".into(),
-        })
-    } else {
-        Ok(AccessDecision {
-            read: mode & 0o004 != 0,
-            write: mode & 0o002 != 0,
-            exec: mode & 0o001 != 0,
-            reason: "other".into(),
-        })
-    }
-}
-
-/// `Metadata` doesn't carry the originating path — in practice callers
-/// know it and we'd prefer to pass it in, but to keep the shared API
-/// narrow we fetch it via `/proc/self/fd` not an option, so callers that
-/// want ACL-aware evaluation should prefer `effective_for_path` below.
-fn resolve_acl_path(_md: &Metadata) -> Option<std::path::PathBuf> {
-    None
-}
-
-/// Path-based variant. Prefer this over `effective_for_user` when the
-/// caller already has the path — it's the only way ACL entries reach
-/// the decision.
+/// group/other triads (no mask, since no mask entry exists).
+///
+/// Takes a path rather than `Metadata` on purpose: `Metadata` does not
+/// carry the originating path, and without it the ACL entries above cannot
+/// be read at all.
 pub fn effective_for_user_path(path: &std::path::Path, username: &str) -> Result<AccessDecision> {
     let md = std::fs::symlink_metadata(path)?;
     let u = lookup_user(username)?;

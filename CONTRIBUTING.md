@@ -45,6 +45,26 @@ CI runs the same commands on every push and pull request.
 - Errors go through `crate::errors::PmError`. No `unwrap()` on user input.
 - All file paths are `Path`/`PathBuf`, never `String`, so non-UTF-8 paths work.
 
+## A fix is not done until something proves it
+
+Do not mark a bug fixed on the strength of having read the diff. Before it
+goes in a changelog, one of these must exist:
+
+- an assertion in `tests/smoke-test.sh` that fails without the fix, or
+- a unit test covering the decision the fix changed, or
+- a reproduction run against the built binary, pasted into the PR.
+
+This is not process for its own sake. During the July 2026 audit review,
+`seal`'s pinhole isolation bug (§H-02) was analysed correctly, written up
+correctly, and then never actually fixed — the claim reached `CHANGELOG.md`
+and a published release because nobody ran the command. It was caught only
+by a later inventory. Every other fix in that batch had a test or a
+reproduction; that one had neither, and it is the one that got through.
+
+If a fix genuinely cannot be tested in CI (it needs particular hardware, a
+filesystem the runner lacks, or a race), say so explicitly in the PR and in
+the code comment, rather than leaving the gap implicit.
+
 ## Adding a subcommand
 
 1. Add a variant to `Command` (or `AclCmd`) in [`src/cli.rs`](src/cli.rs).
