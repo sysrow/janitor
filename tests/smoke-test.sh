@@ -278,7 +278,7 @@ $JAN revoke "$ROOT/deep/dir/target.txt" --user "$USER" > /dev/null 2>&1
 if id -Gn "$USER" | tr ' ' '\n' | grep -qx "$PGRP"; then fail "user still in group after revoke"; else pass "long revoke removed user"; fi
 
 # regrant, then revoke via short
-OUT5=$($JAN g "$ROOT/deep/dir/target.txt" -u "$USER" 2>&1)
+$JAN g "$ROOT/deep/dir/target.txt" -u "$USER" > /dev/null 2>&1
 PGRP2=$(stat -c '%G' "$ROOT/deep/dir/target.txt")
 $JAN rv "$ROOT/deep/dir/target.txt" -u "$USER" > /dev/null 2>&1
 if id -Gn "$USER" | tr ' ' '\n' | grep -qx "$PGRP2"; then fail "alias rv did not revoke"; else pass "alias rv == revoke"; fi
@@ -485,10 +485,113 @@ OUTSIDE_BEFORE=$(stat -c '%U:%G' "$ROOT/target-outside-tree")
 ln -sf "$ROOT/target-outside-tree" "$ROOT/chowntree/link"
 $JAN chown "$USER:$USER" "$ROOT/chowntree" -R > /dev/null 2>&1
 OUTSIDE_AFTER=$(stat -c '%U:%G' "$ROOT/target-outside-tree")
-LINK_OWNER=$(stat -c '%U:%G' "$ROOT/chowntree/link")         # follows symlink (stat default)
-LINK_LOWNER=$(stat -Lc '%U:%G' "$ROOT/target-outside-tree")  # target ownership
+LINK_OWNER=$(stat -hc '%U:%G' "$ROOT/chowntree/link")        # the symlink itself
 if [[ "$OUTSIDE_BEFORE" == "$OUTSIDE_AFTER" ]]; then pass "chown -R does not follow symlinks (target untouched)"; else fail "chown -R followed symlink! before=$OUTSIDE_BEFORE after=$OUTSIDE_AFTER"; fi
+if [[ "$LINK_OWNER" == "$USER:$USER" ]]; then pass "chown -R lchowns the symlink itself"; else fail "chown -R left link at $LINK_OWNER"; fi
 rm -rf "$ROOT/chowntree" "$ROOT/target-outside-tree"
+
+# ── 28d. a symlink named DIRECTLY on the command line is not followed ──
+# This is a different code path from 28c: the operand goes through path
+# resolution rather than the recursive walk. Canonicalizing it used to
+# dereference the link, so `chown` hit the target instead (§H-01).
+touch "$ROOT/direct-target"
+chown root:root "$ROOT/direct-target"
+chmod 0644 "$ROOT/direct-target"
+ln -sfn "$ROOT/direct-target" "$ROOT/direct-link"
+DT_BEFORE=$(stat -c '%U:%G %a' "$ROOT/direct-target")
+$JAN chown "$USER:$USER" "$ROOT/direct-link" > /dev/null 2>&1
+DT_AFTER=$(stat -c '%U:%G %a' "$ROOT/direct-target")
+DL_OWNER=$(stat -hc '%U:%G' "$ROOT/direct-link")
+if [[ "$DT_BEFORE" == "$DT_AFTER" ]]; then pass "direct chown on a symlink leaves the target alone"; else fail "direct chown followed symlink! before=$DT_BEFORE after=$DT_AFTER"; fi
+if [[ "$DL_OWNER" == "$USER:$USER" ]]; then pass "direct chown changes the symlink itself"; else fail "direct chown left link at $DL_OWNER"; fi
+$JAN chmod 0600 "$ROOT/direct-link" > /dev/null 2>&1
+DT_MODE=$(stat -c '%a' "$ROOT/direct-target")
+if [[ "$DT_MODE" == "644" ]]; then pass "direct chmod on a symlink leaves the target alone"; else fail "direct chmod followed symlink! target mode=$DT_MODE"; fi
+rm -f "$ROOT/direct-link" "$ROOT/direct-target"
+
+# ── 28e. restore refuses an entry whose inode was swapped (§C-01) ──────
+mkdir -p "$ROOT/swap"
+echo data > "$ROOT/swap/real"
+chmod 0644 "$ROOT/swap/real"
+echo victim > "$ROOT/swap/victim"
+chmod 0600 "$ROOT/swap/victim"
+SWAP_BID=$($JAN backup "$ROOT/swap/real" 2>&1 | grep -oP '(?<=backup: )\S+')
+rm -f "$ROOT/swap/real"
+ln -s "$ROOT/swap/victim" "$ROOT/swap/real"
+if $JAN restore "$SWAP_BID" --yes > /dev/null 2>&1; then
+    fail "restore applied a snapshot onto a swapped symlink"
+else
+    pass "restore refuses an entry replaced by a symlink"
+fi
+VICTIM_MODE=$(stat -c '%a' "$ROOT/swap/victim")
+if [[ "$VICTIM_MODE" == "600" ]]; then pass "swap victim keeps its mode"; else fail "swap victim became $VICTIM_MODE"; fi
+rm -rf "$ROOT/swap"
+
+# ── 28f. grant on / is rejected, not a panic (§M-08) ──────────────────
+$JAN --dry-run grant / -u "$USER" -r --no-acl > /dev/null 2>&1
+GRANT_ROOT_RC=$?
+if [[ $GRANT_ROOT_RC -eq 1 ]]; then pass "grant / fails validation (not a panic)"; else fail "grant / exited $GRANT_ROOT_RC (101 = panic)"; fi
+
+# ── 28g. audit reports an unreadable subtree instead of "clean" (§H-08) ─
+mkdir -p "$ROOT/blind/inner"
+echo x > "$ROOT/blind/inner/ww.txt"
+chmod 0666 "$ROOT/blind/inner/ww.txt"
+chmod 000 "$ROOT/blind/inner"
+if [[ "$(id -u)" -ne 0 ]]; then
+    # root can read a 000 directory, so this only proves anything unprivileged.
+    if $JAN audit "$ROOT/blind" -W --paths > /dev/null 2>&1; then
+        fail "audit reported success over an unreadable subtree"
+    else
+        pass "audit fails on an unreadable subtree"
+    fi
+    assert "audit --best-effort still succeeds" $JAN audit "$ROOT/blind" -W --paths --best-effort
+fi
+chmod 755 "$ROOT/blind/inner"
+rm -rf "$ROOT/blind"
+
+# ── 28h. attr honours --dry-run (§H-06) ───────────────────────────────
+if command -v chattr > /dev/null 2>&1; then
+    touch "$ROOT/attr-dry"
+    ATTR_BEFORE=$(lsattr -d "$ROOT/attr-dry" 2>/dev/null | awk '{print $1}')
+    $JAN --dry-run attr set-immutable "$ROOT/attr-dry" > /dev/null 2>&1
+    ATTR_AFTER=$(lsattr -d "$ROOT/attr-dry" 2>/dev/null | awk '{print $1}')
+    if [[ "$ATTR_BEFORE" == "$ATTR_AFTER" ]]; then pass "attr --dry-run does not run chattr"; else fail "attr --dry-run changed flags: $ATTR_BEFORE -> $ATTR_AFTER"; fi
+    chattr -i "$ROOT/attr-dry" 2>/dev/null || true
+    rm -f "$ROOT/attr-dry"
+fi
+
+# ── 28i. backup ids are validated before use (§H-07) ──────────────────
+refute "restore rejects a traversal-shaped backup id" $JAN export "../../../../etc/passwd"
+
+# ── 28j. batch is atomic: a bad later line changes nothing (§H-12) ─────
+mkdir -p "$ROOT/batchtx"
+echo a > "$ROOT/batchtx/one"
+echo b > "$ROOT/batchtx/two"
+chmod 0644 "$ROOT/batchtx/one" "$ROOT/batchtx/two"
+cat > "$ROOT/batchtx/ops.txt" <<EOF
+chmod 0600 $ROOT/batchtx/one
+chmod not-a-mode $ROOT/batchtx/two
+EOF
+refute "batch with an invalid line fails" $JAN batch "$ROOT/batchtx/ops.txt"
+BATCH_ONE=$(stat -c '%a' "$ROOT/batchtx/one")
+if [[ "$BATCH_ONE" == "644" ]]; then pass "batch validated everything before mutating"; else fail "batch applied line 1 before rejecting line 2 (mode=$BATCH_ONE)"; fi
+rm -rf "$ROOT/batchtx"
+
+# ── 28k. grant does not drop setgid/setuid bits (§H-09) ───────────────
+mkdir -p "$ROOT/setid"
+touch "$ROOT/setid/bin"
+chmod 4750 "$ROOT/setid/bin"
+$JAN grant "$ROOT/setid/bin" -g "$(id -gn)" -a rx --no-acl > /dev/null 2>&1
+SETID_MODE=$(stat -c '%a' "$ROOT/setid/bin")
+if [[ "$SETID_MODE" == "4750" ]]; then pass "grant preserves setuid across chgrp"; else fail "grant dropped setid: 4750 -> $SETID_MODE"; fi
+rm -rf "$ROOT/setid"
+
+# ── 28l. recursive tighten reaches every descendant (§H-11) ───────────
+mkdir -p "$ROOT/tighten/a/b"
+touch "$ROOT/tighten/a/b/f1" "$ROOT/tighten/a/f2"
+assert "recursive chmod 000 completes without per-path failures" $JAN chmod 000 "$ROOT/tighten" -R
+chmod -R u+rwX "$ROOT/tighten"
+rm -rf "$ROOT/tighten"
 
 # ── 29. audit filters (long + short) ────────────────────────────────
 chmod 777 "$ROOT/deep/dir/target.txt"
@@ -983,7 +1086,7 @@ touch "$ROOT/h"; chmod 0644 "$ROOT/h"
 $JAN chmod 0600 "$ROOT/h" > /dev/null
 HO=$(tty_run "$JAN history $ROOT/h --since 1h")
 assert_grep "history --since 1h lists it"    "$HO" "chmod"
-HO2=$($JAN history "$ROOT/h" -s 1s 2>&1 || true)
+$JAN history "$ROOT/h" -s 1s > /dev/null 2>&1 || true
 rm -f "$ROOT/h"
 
 # ── 67. attr show (lsattr) ────────────────────────────────────────

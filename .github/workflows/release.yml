@@ -12,8 +12,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Release used to build and publish straight off the tag, with no gates of
+  # its own, relying on branch CI having run at some point. A tag on an
+  # untested commit could ship. These jobs make the release depend on the
+  # same checks CI enforces, against the tagged tree itself.
+  gate:
+    name: fmt + clippy + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --release -- -D warnings
+      - name: cargo test
+        run: cargo test --release --all-targets
+
+  smoke:
+    name: docker smoke tests
+    runs-on: ubuntu-latest
+    needs: [gate]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release
+      - name: Build test image
+        run: docker build -f tests/Dockerfile -t janitor-test .
+      - name: Run smoke tests
+        run: docker run --rm janitor-test
+
   build:
     name: build ${{ matrix.artifact_name }}
+    needs: [gate, smoke]
     # ubuntu-22.04 provides glibc 2.35, so resulting .deb / .tar.gz binaries
     # run on Debian 12 (glibc 2.36), Ubuntu 22.04+, RHEL 9+, and newer.
     runs-on: ubuntu-22.04

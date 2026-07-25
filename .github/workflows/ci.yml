@@ -1,10 +1,12 @@
 name: CI
 
+# `dev` is where all work lands first (see CONTRIBUTING.md); without it here
+# every PR into dev merged without ever running these gates.
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, dev]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, dev]
 
 env:
   CARGO_TERM_COLOR: always

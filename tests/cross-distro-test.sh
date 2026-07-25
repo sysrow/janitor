@@ -44,9 +44,7 @@ cleanup() {
     for u in xd_user xd_user2 seal_user mask_user cp_user whocan_user defacl_user xd_orphan; do
         userdel -rf "$u" 2>/dev/null || true
     done
-    for g in xd_grp; do
-        groupdel "$g" 2>/dev/null || true
-    done
+    groupdel xd_grp 2>/dev/null || true
     # clean managed groups
     getent group | awk -F: '/^pm_xd_/{print $1}' | while read -r g; do groupdel "$g" 2>/dev/null; done
     rm -rf "$ROOT"
@@ -111,13 +109,24 @@ chmod 0600 "$ROOT/mask_f"
 $JAN acl grant "$ROOT/mask_f" -u mask_user -a rw 2>/dev/null
 EFF=$(getfacl -c "$ROOT/mask_f" 2>&1)
 assert_grep "mask test: user has rw" "$EFF" "user:mask_user:rw"
-# snapshot with ACL, then clobber mask via chmod
-BID=$($JAN backup "$ROOT/mask_f" -A 2>&1 | grep -oP '(?<=backup: )\S+')
+# Snapshot with ACL. `backup` captures ACLs by default (opt out with
+# --no-acl); the old `-A` here was not a real flag, so the command failed,
+# BID stayed empty and no restore ever ran — while the grep below still
+# matched the *unrestored* ACL text and reported a pass.
+BID=$($JAN backup "$ROOT/mask_f" 2>&1 | grep -oP '(?<=backup: )\S+')
+if [[ -n "$BID" ]]; then pass "backup returns an id"; else fail "backup returned no id"; fi
+# Clobber the mask via chmod: the named entry survives but becomes
+# ineffective, which is exactly what getfacl marks as #effective.
 chmod 0600 "$ROOT/mask_f"
+CLOBBERED=$(getfacl -c "$ROOT/mask_f" 2>&1)
+assert_grep "chmod makes the named ACL ineffective" "$CLOBBERED" "user:mask_user:rw-.*#effective:---"
 # restore should bring back both mode AND ACL
-$JAN restore "$BID" --yes 2>/dev/null
+if [[ -n "$BID" ]]; then
+    assert "restore exits cleanly" $JAN restore "$BID" --yes
+fi
 EFF2=$(getfacl -c "$ROOT/mask_f" 2>&1)
 assert_grep "restore recovers ACL after mask clobber" "$EFF2" "user:mask_user:rw"
+refute_grep "restored ACL is effective again" "$EFF2" "user:mask_user:rw-.*#effective:---"
 rm -f "$ROOT/mask_f"
 userdel mask_user 2>/dev/null || true
 echo
@@ -494,7 +503,7 @@ assert_eq "chown root:root" "$O" "root:root"
 $JAN chown nobody "$ROOT/own_test" 2>/dev/null
 O=$(stat -c '%U' "$ROOT/own_test")
 assert_eq "chown nobody (user only)" "$O" "nobody"
-GRP=$(id -gn nobody 2>/dev/null || echo "nobody")
+# (nobody's primary group name is not needed; the ACL specs below use the user)
 $JAN chown :root "$ROOT/own_test" 2>/dev/null
 G=$(stat -c '%G' "$ROOT/own_test")
 assert_eq "chown :root (group only)" "$G" "root"
