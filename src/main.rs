@@ -145,8 +145,12 @@ fn run(cli: Cli) -> errors::Result<()> {
             recursive,
             no_acl,
         } => commands::cmd_backup(&path, recursive, !no_acl),
-        Command::Restore { backup_id, yes } => commands::cmd_restore(&backup_id, dry_run, yes),
-        Command::Undo { yes } => commands::cmd_undo(dry_run, yes),
+        Command::Restore {
+            backup_id,
+            yes,
+            skip_missing,
+        } => commands::cmd_restore(&backup_id, dry_run, yes, skip_missing),
+        Command::Undo { yes, skip_missing } => commands::cmd_undo(dry_run, yes, skip_missing),
         Command::History { path, since } => commands::cmd_history(&path, since.as_deref(), json),
         Command::CopyPerms {
             src,

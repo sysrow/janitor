@@ -4,7 +4,7 @@
 use crate::acl::{acl_modify, acl_remove, acl_strip, get_acl, get_default_acl, supports_acl};
 use crate::backup::save_backup;
 use crate::errors::{PmError, Result};
-use crate::helpers::{parse_access, resolve_path};
+use crate::helpers::{parse_access, resolve_path_nofollow};
 use crate::locking::with_lock;
 use crate::snapshot::snapshot_with_acl;
 use crate::types::Operation;
@@ -23,7 +23,7 @@ pub fn cmd_acl_grant(
     if user.is_none() && group.is_none() {
         return Err(PmError::NoUserOrGroup);
     }
-    let target = resolve_path(path)?;
+    let target = resolve_path_nofollow(path)?;
     crate::locks::ensure_not_locked(&target)?;
     if !supports_acl(&target) {
         return Err(PmError::AclUnsupported { path: target });
@@ -102,7 +102,7 @@ pub fn cmd_acl_revoke(
     if user.is_none() && group.is_none() {
         return Err(PmError::NoUserOrGroup);
     }
-    let target = resolve_path(path)?;
+    let target = resolve_path_nofollow(path)?;
     crate::locks::ensure_not_locked(&target)?;
     if !supports_acl(&target) {
         return Err(PmError::AclUnsupported { path: target });
@@ -149,7 +149,7 @@ pub fn cmd_acl_revoke(
 
 /// `acl strip PATH [--recursive]`: remove all ACLs.
 pub fn cmd_acl_strip(path: &str, recursive: bool, dry_run: bool) -> Result<()> {
-    let target = resolve_path(path)?;
+    let target = resolve_path_nofollow(path)?;
     crate::locks::ensure_not_locked(&target)?;
     if !supports_acl(&target) {
         return Err(PmError::AclUnsupported { path: target });
@@ -192,7 +192,7 @@ pub fn cmd_acl_strip(path: &str, recursive: bool, dry_run: bool) -> Result<()> {
 
 /// `acl show PATH`: print both access and default ACL.
 pub fn cmd_acl_show(path: &str) -> Result<()> {
-    let target = resolve_path(path)?;
+    let target = resolve_path_nofollow(path)?;
     println!("# path: {}", target.display());
     match get_acl(&target)? {
         Some(a) => println!("{a}"),

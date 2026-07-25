@@ -17,6 +17,13 @@ pub struct SnapEntry {
     pub gid: u32,
     pub is_symlink: bool,
     pub is_dir: bool,
+    /// `st_dev` of the captured inode. Zero in backups written before
+    /// identity checking existed, which restore treats as "unknown".
+    #[serde(default)]
+    pub dev: u64,
+    /// `st_ino` of the captured inode. Zero means "unknown" (see `dev`).
+    #[serde(default)]
+    pub ino: u64,
     /// Raw ACL text (as produced by `getfacl -c`). None if ACLs not captured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acl: Option<String>,

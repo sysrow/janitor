@@ -41,6 +41,8 @@ pub fn snapshot_with_acl(paths: &[impl AsRef<Path>], capture_acl: bool) -> Vec<S
                 gid: md.gid(),
                 is_symlink,
                 is_dir,
+                dev: md.dev(),
+                ino: md.ino(),
                 acl,
                 default_acl,
             })

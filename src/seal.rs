@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::acl::{acl_modify, supports_acl};
 use crate::backup::save_backup;
 use crate::errors::{PmError, Result};
-use crate::helpers::{parse_access, resolve_path};
+use crate::helpers::{parse_access, resolve_path_nofollow};
 use crate::locking::with_lock;
 use crate::matcher::ExcludeSet;
 use crate::render::{self, paint, Style};
@@ -107,7 +107,7 @@ fn parse_allow(spec: &str, target: &str, kind: char) -> Result<Pinhole> {
         kind,
         name: name.to_string(),
         perm: canonical,
-        path: resolve_path(target)?,
+        path: resolve_path_nofollow(target)?,
     })
 }
 
@@ -144,7 +144,7 @@ pub fn cmd_seal(
     exclude: &[String],
     dry_run: bool,
 ) -> Result<()> {
-    let base_path = resolve_path(base)?;
+    let base_path = resolve_path_nofollow(base)?;
     crate::locks::ensure_not_locked(&base_path)?;
     if !base_path.is_dir() {
         return Err(PmError::SealBaseNotDir(base_path));

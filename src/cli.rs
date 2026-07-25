@@ -156,6 +156,9 @@ For partial (bit-level) revocation, use one of:\n  \
         /// Skip the interactive confirmation prompt.
         #[arg(short = 'y', long = "yes")]
         yes: bool,
+        /// Report paths that no longer exist as skipped instead of failing.
+        #[arg(long)]
+        skip_missing: bool,
     },
 
     /// Undo the most recent backup (shortcut for `restore $(list-backups | head -1)`).
@@ -171,6 +174,9 @@ Combine with --dry-run to preview what would be reverted."
         /// Skip the interactive confirmation prompt.
         #[arg(short = 'y', long = "yes")]
         yes: bool,
+        /// Report paths that no longer exist as skipped instead of failing.
+        #[arg(long)]
+        skip_missing: bool,
     },
 
     /// Show the backup history touching PATH (newest first).

@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use crate::backup::save_backup;
 use crate::errors::{PmError, Result};
-use crate::helpers::resolve_path;
+use crate::helpers::{resolve_path, resolve_path_nofollow};
 use crate::locking::with_lock;
 use crate::matcher::ExcludeSet;
+use crate::perms::lchown;
 use crate::render::{paint, summary_line, Style};
 use crate::snapshot::snapshot_with_acl;
 use crate::types::Operation;
@@ -17,6 +18,10 @@ use crate::users::{gid_to_name, lookup_group, lookup_user, uid_to_name};
 /// Resolve each input path, enforce `ensure_not_locked`, and expand to a flat
 /// list honoring `recursive` + `exclude`. Returns `(resolved_targets, paths)`.
 /// Fail-closed: any missing / locked path aborts before any mutation.
+///
+/// Operands are resolved with [`resolve_path_nofollow`], so a symlink named
+/// directly on the command line is operated on as a symlink and never
+/// dereferenced into its target.
 pub fn expand_targets(
     paths_in: &[String],
     recursive: bool,
@@ -25,14 +30,17 @@ pub fn expand_targets(
     let mut paths = Vec::new();
     let mut resolved_targets = Vec::new();
     for p in paths_in {
-        let t = resolve_path(p)?;
+        let t = resolve_path_nofollow(p)?;
         crate::locks::ensure_not_locked(&t)?;
         resolved_targets.push(t.clone());
         if exclude.is_excluded(&t) {
             continue;
         }
+        let is_dir = fs::symlink_metadata(&t)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         paths.push(t.clone());
-        if recursive && t.is_dir() {
+        if recursive && is_dir {
             for entry in walkdir::WalkDir::new(&t)
                 .min_depth(1)
                 .follow_links(false)
@@ -222,22 +230,6 @@ pub fn resolve_chown_target(
         Ok((Some(md.uid()), Some(md.gid())))
     } else {
         parse_chown_spec(spec)
-    }
-}
-
-/// lchown via libc: does NOT follow symlinks (unlike std::os::unix::fs::chown).
-fn lchown(path: &Path, uid: Option<u32>, gid: Option<u32>) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let u = uid.unwrap_or(u32::MAX); // -1 = don't change
-    let g = gid.unwrap_or(u32::MAX);
-    let ret = unsafe { libc::lchown(c_path.as_ptr(), u, g) };
-    if ret != 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
     }
 }
 
@@ -552,8 +544,10 @@ pub fn cmd_copy_perms(
     dry_run: bool,
 ) -> Result<()> {
     use nix::unistd::{Gid, Uid};
+    // SRC is only read from, so its symlink is followed like `--reference`
+    // does. DST is mutated, so its final component stays un-dereferenced.
     let src_path = resolve_path(src)?;
-    let dst_path = resolve_path(dst)?;
+    let dst_path = resolve_path_nofollow(dst)?;
     crate::locks::ensure_not_locked(&dst_path)?;
     let src_md = fs::symlink_metadata(&src_path).map_err(|e| PmError::InsufficientPrivileges {
         path: src_path.clone(),

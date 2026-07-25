@@ -9,7 +9,7 @@ use crate::backup::{load_backup, save_backup};
 use crate::errors::{PmError, Result};
 use crate::groups::{add_user_to_group, ensure_group, remove_user_from_group};
 use crate::helpers::{
-    default_group_name, parse_access, path_chain, resolve_path, validate_group_name,
+    default_group_name, parse_access, path_chain, resolve_path_nofollow, validate_group_name,
 };
 use crate::locking::with_lock;
 use crate::perms::{apply_group_bits, apply_restore};
@@ -37,7 +37,7 @@ pub fn cmd_grant(
         lookup_user(u)?; // fail fast
     }
 
-    let target = resolve_path(path)?;
+    let target = resolve_path_nofollow(path)?;
     crate::locks::ensure_not_locked(&target)?;
     let access_bits = parse_access(access)?;
 
@@ -383,7 +383,7 @@ fn collect_recursive(target: &Path, exclude: &crate::matcher::ExcludeSet) -> Vec
 }
 
 pub fn cmd_revoke(user: &str, path: &str, group: Option<&str>, dry_run: bool) -> Result<()> {
-    let target = resolve_path(path)?;
+    let target = resolve_path_nofollow(path)?;
     let group_name = match group {
         Some(g) => g.to_string(),
         None => default_group_name(&target),
@@ -397,7 +397,7 @@ pub fn cmd_revoke(user: &str, path: &str, group: Option<&str>, dry_run: bool) ->
 }
 
 pub fn cmd_backup(path: &str, recursive: bool, capture_acl: bool) -> Result<()> {
-    let target = resolve_path(path)?;
+    let target = resolve_path_nofollow(path)?;
     let mut paths = vec![target.clone()];
     if recursive && target.is_dir() {
         let empty = crate::matcher::ExcludeSet::new(&[])?;
@@ -425,13 +425,18 @@ pub fn cmd_backup(path: &str, recursive: bool, capture_acl: bool) -> Result<()> 
     })
 }
 
-pub fn cmd_restore(backup_id: &str, dry_run: bool, assume_yes: bool) -> Result<()> {
+pub fn cmd_restore(
+    backup_id: &str,
+    dry_run: bool,
+    assume_yes: bool,
+    skip_missing: bool,
+) -> Result<()> {
     let data = load_backup(backup_id)?;
-    restore_with_preview(&data, dry_run, assume_yes, "restore")
+    restore_with_preview(&data, dry_run, assume_yes, skip_missing, "restore")
 }
 
 /// Undo the most recent backup (newest by file mtime).
-pub fn cmd_undo(dry_run: bool, assume_yes: bool) -> Result<()> {
+pub fn cmd_undo(dry_run: bool, assume_yes: bool, skip_missing: bool) -> Result<()> {
     let files = crate::backup::list_backup_files()?;
     let latest = files
         .iter()
@@ -447,13 +452,14 @@ pub fn cmd_undo(dry_run: bool, assume_yes: bool) -> Result<()> {
         .ok_or_else(|| PmError::Other("invalid backup filename".into()))?
         .to_string();
     let data = load_backup(&bid)?;
-    restore_with_preview(&data, dry_run, assume_yes, "undo")
+    restore_with_preview(&data, dry_run, assume_yes, skip_missing, "undo")
 }
 
 fn restore_with_preview(
     data: &crate::types::Backup,
     dry_run: bool,
     assume_yes: bool,
+    skip_missing: bool,
     verb: &str,
 ) -> Result<()> {
     let stdout_tty = is_terminal::is_terminal(std::io::stdout());
@@ -570,7 +576,7 @@ fn restore_with_preview(
         }
     }
 
-    let errors = apply_restore(&data.entries, dry_run);
+    let errors = apply_restore(&data.entries, dry_run, skip_missing);
     if errors > 0 {
         return Err(PmError::Other(format!("{errors} error(s) during restore")));
     }
@@ -806,7 +812,7 @@ pub fn cmd_history(path: &str, since: Option<&str>, as_json: bool) -> Result<()>
 }
 
 pub fn cmd_lock(path: &str, reason: Option<&str>) -> Result<()> {
-    let p = resolve_path(path)?;
+    let p = resolve_path_nofollow(path)?;
     crate::locks::add(&p, reason)?;
     let g = glyphs();
     println!(
@@ -834,7 +840,7 @@ pub fn cmd_lock(path: &str, reason: Option<&str>) -> Result<()> {
 }
 
 pub fn cmd_unlock(path: &str) -> Result<()> {
-    let p = resolve_path(path)?;
+    let p = resolve_path_nofollow(path)?;
     crate::locks::remove(&p)?;
     let g = glyphs();
     println!(
