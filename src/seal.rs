@@ -207,14 +207,18 @@ pub fn cmd_seal(
         baseline_paths.push(base_path.clone());
     }
 
-    // --- derive parent chain for each pinhole, dedup ---
+    // --- derive the parent chain of each pinhole, kept SEPARATE ---
+    //
+    // Merging every pinhole's chain into one set and then granting each
+    // principal traversal over all of it is how a user allowed only under
+    // /base/a also ended up with --x on /base/b. The union is still what the
+    // snapshot has to cover; the ACL writes must stay per-pinhole.
     use std::collections::BTreeSet;
-    let mut chains: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut chains: Vec<Vec<PathBuf>> = Vec::with_capacity(pinholes.len());
     for p in &pinholes {
-        for c in chain_from_base(&base_path, &p.path)? {
-            chains.insert(c);
-        }
+        chains.push(chain_from_base(&base_path, &p.path)?);
     }
+    let chain_union: BTreeSet<PathBuf> = chains.iter().flatten().cloned().collect();
 
     if dry_run {
         print_card(
@@ -232,7 +236,7 @@ pub fn cmd_seal(
     // --- transactional apply under single lock + single backup ---
     with_lock(|| {
         let mut snap_set: Vec<PathBuf> = baseline_paths.clone();
-        for c in &chains {
+        for c in &chain_union {
             snap_set.push(c.clone());
         }
         for p in &pinholes {
@@ -259,15 +263,23 @@ pub fn cmd_seal(
 
         apply_baseline(&baseline_paths, &spec)?;
 
-        for p in &pinholes {
-            for dir in &chains {
+        // Each principal gets traversal on its OWN ancestors only. Dedup on
+        // (principal, path) so two pinholes for the same user sharing a
+        // parent don't setfacl the same directory twice.
+        let mut applied: BTreeSet<(String, PathBuf)> = BTreeSet::new();
+        for (p, chain) in pinholes.iter().zip(&chains) {
+            let principal = format!("{}:{}", p.kind, p.name);
+            for dir in chain {
                 if dir == &p.path {
                     continue;
                 }
-                let s = format!("{}:{}:--x", p.kind, p.name);
+                if !applied.insert((principal.clone(), dir.clone())) {
+                    continue;
+                }
+                let s = format!("{principal}:--x");
                 acl_modify(dir, &s, false, false)?;
             }
-            let s = format!("{}:{}:{}", p.kind, p.name, p.perm);
+            let s = format!("{principal}:{}", p.perm);
             acl_modify(&p.path, &s, false, false)?;
         }
 

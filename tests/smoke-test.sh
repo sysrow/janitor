@@ -569,6 +569,56 @@ RW_MODE=$(stat -c '%a' "$ROOT/rewrite/f")
 if [[ "$RW_MODE" == "644" ]]; then pass "--allow-replaced restored the mode"; else fail "--allow-replaced left mode $RW_MODE"; fi
 rm -rf "$ROOT/rewrite"
 
+# ── 28e3. undo takes back the account changes a grant made (§H-03) ────
+mkdir -p "$ROOT/acct"
+echo x > "$ROOT/acct/f"
+# Diff the membership list rather than grepping for a pm_ prefix: the test
+# user is itself called pm_smoke_user, so its own primary group matches that
+# prefix and would be picked up instead of the group grant created.
+ACCT_BEFORE=$(id -nG "$USER" 2>/dev/null | tr ' ' '\n' | sort)
+$JAN grant "$ROOT/acct/f" -u "$USER" -r --no-acl > /dev/null 2>&1
+ACCT_AFTER=$(id -nG "$USER" 2>/dev/null | tr ' ' '\n' | sort)
+ACCT_GRP=$(comm -13 <(echo "$ACCT_BEFORE") <(echo "$ACCT_AFTER") | head -1)
+if [[ -n "$ACCT_GRP" ]]; then pass "grant added $USER to a managed group"; else fail "grant created no managed group membership"; fi
+$JAN undo --yes > /dev/null 2>&1
+if [[ -z "$ACCT_GRP" ]]; then
+    fail "undo removed the managed group membership (no group to check)"
+    fail "undo deleted the managed group it created (no group to check)"
+elif id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -q "^${ACCT_GRP}\$"; then
+    fail "undo left $USER in $ACCT_GRP"
+else
+    pass "undo removed the managed group membership"
+    if getent group "$ACCT_GRP" > /dev/null 2>&1; then
+        fail "undo left the managed group $ACCT_GRP behind"
+    else
+        pass "undo deleted the managed group it created"
+    fi
+fi
+rm -rf "$ROOT/acct"
+
+# ── 28e4. seal keeps pinholes in their own branch (§H-02) ─────────────
+if command -v setfacl > /dev/null 2>&1 && getent passwd daemon > /dev/null 2>&1; then
+    SEAL_ISO=/tmp/pm_seal_iso
+    rm -rf "$SEAL_ISO"
+    mkdir -p "$SEAL_ISO/a" "$SEAL_ISO/b"
+    echo a > "$SEAL_ISO/a/file"
+    echo b > "$SEAL_ISO/b/file"
+    if $JAN seal "$SEAL_ISO" -B "root:root:700" -R \
+        --allow "$USER:r" "$SEAL_ISO/a/file" \
+        --allow daemon:r "$SEAL_ISO/b/file" > /dev/null 2>&1; then
+        A_ACL=$(getfacl -c "$SEAL_ISO/a" 2>/dev/null)
+        B_ACL=$(getfacl -c "$SEAL_ISO/b" 2>/dev/null)
+        assert_grep "seal: branch a carries its own principal" "$A_ACL" "user:$USER:"
+        refute_grep "seal: branch a has no foreign principal" "$A_ACL" "user:daemon:"
+        assert_grep "seal: branch b carries its own principal" "$B_ACL" "user:daemon:"
+        refute_grep "seal: branch b has no foreign principal" "$B_ACL" "user:$USER:"
+    else
+        echo "  SKIP  seal pinhole isolation (seal failed on this filesystem)"
+    fi
+    $JAN undo --yes > /dev/null 2>&1
+    rm -rf "$SEAL_ISO"
+fi
+
 # ── 28f. grant on / is rejected, not a panic (§M-08) ──────────────────
 $JAN --dry-run grant / -u "$USER" -r --no-acl > /dev/null 2>&1
 GRANT_ROOT_RC=$?

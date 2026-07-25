@@ -171,6 +171,16 @@ fn kind_word(is_symlink: bool, is_dir: bool) -> &'static str {
 pub fn apply_restore(entries: &[SnapEntry], opts: RestoreOptions) -> u32 {
     let dry_run = opts.dry_run;
     let mut errors = 0u32;
+    // Entries whose ACLs were never captured cannot have them restored. Say
+    // so rather than letting a clean-looking restore imply the ACLs came
+    // back too.
+    let uncaptured = entries.iter().filter(|e| e.acl_unavailable).count();
+    if uncaptured > 0 {
+        eprintln!(
+            "warning: {uncaptured} entry(ies) had no ACLs captured (tooling or filesystem \
+             did not support it); their ACLs are not restored"
+        );
+    }
     for entry in entries.iter().rev() {
         let p = &entry.path;
         let md = match fs::symlink_metadata(p) {
