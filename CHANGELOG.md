@@ -7,6 +7,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-07-25
+
+Security and correctness pass over the whole codebase. The theme is
+fail-closed: several commands used to treat "I could not determine this"
+as "there is nothing there", and the snapshot-before-mutate guarantee had
+holes that made some changes unrevertible.
+
+### Security
+
+- **Restore followed a symlink planted after the snapshot.** A regular
+  file swapped for a symlink between `backup` and `restore` had the
+  recorded mode and ownership applied to the link's *target*; a hard-link
+  swap worked the same way. Restore now re-stats every entry and refuses
+  it if the file type or `(dev, ino)` no longer matches. Ownership is
+  applied with `lchown` even for non-symlink entries, so a swap racing the
+  check cannot redirect it either.
+- **`chown` / `chmod` dereferenced a symlink named on the command line.**
+  Path resolution canonicalized the whole operand, so `janitor chown
+  :grp link` changed the target's group instead of the link's —
+  contradicting the `lchown(2)` semantics documented in the README.
+  Mutating commands now keep the final component intact.
+- **`seal` leaked pinhole traversal into unrelated branches.** Parent
+  chains of all pinholes were merged into one set and every principal was
+  granted `--x` on all of it, so a user allowed only under `/base/a`
+  also got traversal on `/base/b`. Each pinhole now applies only to its
+  own ancestors.
+- **`restore` accepted arbitrary backup ids.** `load_backup` interpolated
+  its argument straight into a path, so `restore ../../elsewhere` read
+  and applied a payload from outside the backup directory. Ids are
+  validated against the generated form.
+- **`janitor lock` could be bypassed three ways:** an unreadable
+  `locks.txt` was treated as "no locks", recursive `acl grant/revoke/strip`
+  checked only the root while `setfacl -R` rewrote every descendant, and
+  `restore`/`undo` checked no locks at all and ran outside the global
+  flock. All three are closed.
+- **`grant` left account changes behind.** `groupadd` and `gpasswd` ran
+  before the lock and before the backup existed, and no restore ever
+  undid them — so the access a grant handed out survived its own "full
+  revert". They now run inside the transaction, and the backup records
+  them so `restore` / `undo` take them back out.
+
+### Fixed
+
+- **Snapshots failed open.** Unreadable paths were dropped silently and
+  every `getfacl` failure became "no ACL", so a mutation could proceed on
+  a backup that could not undo it. Snapshotting now aborts the command
+  instead. Missing `getfacl` and filesystems without ACL support are not
+  failures — those entries are flagged, with one warning per run.
+- **ACLs are captured by every mutating command**, including `batch`,
+  `policy`, `seal`, presets and `audit --fix`. All of them run `chmod`,
+  which rewrites the ACL mask, so omitting ACLs meant `undo` could not
+  restore the original effective permissions.
+- **setuid/setgid bits were dropped silently.** `grant` computed the
+  target mode before the `chgrp` and skipped the `chmod` when nothing had
+  "changed", and `policy apply` ran `chmod` before `chown`. Both now
+  apply ownership first and the mode second, unconditionally.
+- **Recursive `chmod` left trees half-changed.** Tightening a tree
+  removed the traverse bit from the root and then failed on everything
+  below it. Paths are now applied deepest-first.
+- **`batch` was neither fail-closed nor atomic.** Mode specs were carried
+  as unchecked strings and parsed during application, so a bad spec on
+  line 2 surfaced after line 1 had been written; per-path failures were
+  swallowed entirely. Specs are validated up front and any failure rolls
+  the run back.
+- **`grant /` panicked** (exit 101) after `groupadd` had already run.
+- **`audit` reported clean scans over subtrees it never read.**
+- **`compare` stored ACLs as a boolean**, so two paths with the same mode
+  but different grants were "identical". It now compares entries and
+  shows which side each difference is on.
+- **`diff` flagged an ACL change on every entry that had an ACL**, making
+  a backup-then-diff report changes on an untouched tree.
+- **`policy verify` blessed policies `apply` rejects** and skipped
+  ownership checks for users and groups that do not exist. Both now share
+  one rule resolver. `verify` also skips symlink modes, as `apply` does,
+  so a recursive policy can reach a clean state.
+- **`who-can` claimed root could execute any file** (the kernel still
+  requires an x bit) and omitted root from its JSON output entirely.
+- **`attr` ignored `--dry-run`**, took no snapshot and held no lock.
+- **Backups were written non-atomically**, so an interrupted write left a
+  truncated file as the newest backup — the one `undo` picks up.
+- **The lock list was written non-atomically** through a shared temp name
+  and outside any lock, so concurrent `janitor lock` calls lost entries.
+- With no `$HOME`, the backup directory fell back to a shared `/tmp` path
+  that every HOME-less user would collide in.
+- `--since` no longer panics on durations that overflow; `explain` emits
+  `grant` commands that actually parse; pre-1970 mtimes no longer render
+  as far-future dates; `tree` counts world-writable directories in line
+  with `audit`, exempting sticky ones; `Cargo.lock` matches the manifest
+  so `--locked` builds work.
+
+### Changed
+
+- CI now runs for `dev`, where all work lands first. Releases run fmt,
+  clippy, unit tests and the docker smoke suite against the tagged tree
+  instead of publishing unconditionally.
+- The distro orchestrator no longer carries host addresses; copy
+  `tests/hosts.env.example` to `tests/hosts.env` (git-ignored). It also
+  records each job's exit status, so an SSH failure or a run that
+  asserted nothing can no longer read as "all tests passed".
+
+### BREAKING
+
+- A symlink named directly as a `chmod` / `chown` operand is no longer
+  dereferenced. This matches the documented `lchown(2)` semantics and
+  differs from coreutils, which dereferences command-line operands.
+- Symbolic modes with no `who` (`chmod +x`) now honour the umask, as
+  POSIX requires and coreutils does: under `umask 077`, `+x` on `0600`
+  gives `0700`, not `0711`. An explicit `a` still ignores the umask.
+- `restore` / `undo` exit non-zero when a snapshotted path no longer
+  exists. Pass `--skip-missing` for the old behaviour.
+- `audit` and `find-orphans` exit non-zero when part of the tree could
+  not be read. Pass `--best-effort` for the old behaviour.
+- A `getfacl` failure on an ACL-capable filesystem now aborts the command
+  rather than recording "no ACL".
+- `restore` refuses entries whose inode changed since the snapshot, which
+  includes files legitimately replaced by an editor's write-and-rename.
+
+### Known limitations
+
+- The restore identity check closes the reproduced swap window but is not
+  fully TOCTOU-proof for the `chmod` half: Linux has no `lchmod`, so a
+  swap between the check and the call is still theoretically possible.
+  Closing it entirely needs `openat2(RESOLVE_NO_SYMLINKS)` throughout the
+  I/O layer.
+- `audit --print0 | janitor chmod --stdin0` still round-trips paths as
+  UTF-8, so filenames that are not valid UTF-8 cannot be addressed
+  through it. It no longer mangles them into a different path, though:
+  `--stdin0` now rejects undecodable input with an error naming the
+  offending bytes instead of substituting U+FFFD.
+
 ## [0.1.5] - 2026-05-09
 
 Static musl binary for broad distro compatibility and test fixes.
