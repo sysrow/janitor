@@ -475,9 +475,10 @@ Backups are never touched by `restore` itself, so you can re-apply or re-revert.
 Nothing here is a silent change — each one either errors out or produces a
 visibly different mode — but this is the list to check before rolling out.
 
-**Act on this one first.** Every release before 0.1.7 that has `seal`
-(0.1.4, 0.1.5, 0.1.6) granted each pinhole principal traversal across
-*every* pinhole's parent chain, not just its own. If you sealed a tree with
+**Act on this one first** ([GHSA-xp8h-3m9f-w38h](https://github.com/sysrow/janitor/security/advisories/GHSA-xp8h-3m9f-w38h)).
+Every release before 0.1.7 that has `seal` (0.1.4, 0.1.5, 0.1.6) granted
+each pinhole principal traversal across *every* pinhole's parent chain,
+not just its own. If you sealed a tree with
 more than one `--allow`, principals hold `--x` on branches they were never
 meant to reach:
 
