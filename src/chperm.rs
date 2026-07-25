@@ -57,8 +57,25 @@ pub fn expand_targets(
     Ok((resolved_targets, paths))
 }
 
+/// Order paths deepest-first so children are chmod'ed before their parents.
+///
+/// `expand_targets` hands back a pre-order walk. Applying it in that order
+/// means a recursive tighten (`chmod 000 dir -R`) strips the traverse bit
+/// from the root and then fails on every descendant underneath it, leaving
+/// the tree half-changed. Post-order avoids that: by the time a directory
+/// loses its own permissions, everything below it is already done.
+///
+/// The walk itself already happened in `expand_targets`, so reordering here
+/// cannot affect which paths are visited.
+fn depth_first(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = paths.to_vec();
+    out.sort_by_key(|b| std::cmp::Reverse(b.components().count()));
+    out
+}
+
 /// Apply a chmod (octal or symbolic, or a fixed `ref_mode`) to each path in
 /// `paths`. Does NOT take a snapshot; the caller must record its own backup.
+/// Applies deepest paths first (see [`depth_first`]).
 /// Returns (changed, unchanged, failed) counts.
 pub fn apply_chmod_to_paths(
     paths: &[PathBuf],
@@ -69,7 +86,8 @@ pub fn apply_chmod_to_paths(
     let mut changed = 0usize;
     let mut unchanged = 0usize;
     let mut failed = 0usize;
-    for p in paths {
+    for p in depth_first(paths) {
+        let p = &p;
         let md = match fs::symlink_metadata(p) {
             Ok(m) => m,
             Err(_) => {
@@ -155,7 +173,8 @@ pub fn apply_chown_to_paths(
     let g_name = new_gid
         .map(|g| gid_to_name(Gid::from_raw(g)))
         .unwrap_or_else(|| "(keep)".into());
-    for p in paths {
+    for p in depth_first(paths) {
+        let p = &p;
         let before = fs::symlink_metadata(p).ok();
         let (bu, bg) = match &before {
             Some(m) => (

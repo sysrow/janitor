@@ -144,15 +144,18 @@ pub fn cmd_policy_apply(file: &str, dry_run: bool) -> Result<()> {
             println!("backup: {bid}");
         }
 
-        // Phase 3: apply each rule.
+        // Phase 3: apply each rule. Ownership first, mode second — chown
+        // clears setuid/setgid, so doing it the other way round silently
+        // dropped those bits and left `policy verify` reporting drift on a
+        // policy that had just been applied successfully.
         for pl in &plans {
-            if let Some(m) = &pl.mode {
-                apply_chmod_to_paths(&pl.paths, m, None, dry_run)
+            if let Some((u, g)) = pl.chown {
+                apply_chown_to_paths(&pl.paths, u, g, dry_run)
                     .map(|_| ())
                     .map_err(|e| PmError::Other(format!("policy rule {:?}: {e}", pl.rule.path)))?;
             }
-            if let Some((u, g)) = pl.chown {
-                apply_chown_to_paths(&pl.paths, u, g, dry_run)
+            if let Some(m) = &pl.mode {
+                apply_chmod_to_paths(&pl.paths, m, None, dry_run)
                     .map(|_| ())
                     .map_err(|e| PmError::Other(format!("policy rule {:?}: {e}", pl.rule.path)))?;
             }

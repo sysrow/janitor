@@ -276,14 +276,28 @@ pub fn apply_group_bits(
         reason: e.to_string(),
     })?;
 
-    // chmod (only if changed)
-    if new_mode != current {
-        fs::set_permissions(path, fs::Permissions::from_mode(new_mode)).map_err(|e| {
-            PmError::InsufficientPrivileges {
+    // chmod unconditionally, even when new_mode == current. `new_mode` was
+    // computed from the mode read *before* the chgrp above, and chown clears
+    // setuid/setgid on executables — so skipping the chmod when nothing
+    // "changed" is exactly the case that silently drops those bits.
+    fs::set_permissions(path, fs::Permissions::from_mode(new_mode)).map_err(|e| {
+        PmError::InsufficientPrivileges {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        }
+    })?;
+    // set_permissions can drop bits above 0o777 on some std versions.
+    if new_mode & 0o7000 != 0 {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| PmError::Other(format!("invalid path: {e}")))?;
+        if unsafe { libc::chmod(c_path.as_ptr(), new_mode as libc::mode_t) } != 0 {
+            return Err(PmError::InsufficientPrivileges {
                 path: path.to_path_buf(),
-                reason: e.to_string(),
-            }
-        })?;
+                reason: std::io::Error::last_os_error().to_string(),
+            });
+        }
     }
 
     Ok(())
