@@ -417,6 +417,8 @@ pub fn cmd_chmod(
                     max_level: None,
                     recursive: Some(recursive),
                     parent_op: None,
+                    group_created: false,
+                    user_added: false,
                 },
             )?;
             println!("backup: {bid}");
@@ -491,6 +493,8 @@ pub fn cmd_chown(
                     max_level: None,
                     recursive: Some(recursive),
                     parent_op: None,
+                    group_created: false,
+                    user_added: false,
                 },
             )?;
             println!("backup: {bid}");
@@ -663,6 +667,8 @@ pub fn cmd_copy_perms(
                     max_level: None,
                     recursive: Some(recursive),
                     parent_op: None,
+                    group_created: false,
+                    user_added: false,
                 },
             )?;
             backup_id = Some(bid);

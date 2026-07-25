@@ -252,6 +252,8 @@ pub fn cmd_seal(
                 max_level: None,
                 recursive: Some(recursive),
                 parent_op: None,
+                group_created: false,
+                user_added: false,
             },
         )?;
 

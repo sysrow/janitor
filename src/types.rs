@@ -91,6 +91,12 @@ pub struct Operation {
     pub recursive: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_op: Option<String>,
+    /// The operation created `group`; restore deletes it again.
+    #[serde(default)]
+    pub group_created: bool,
+    /// The operation added `user` to `group`; restore removes the membership.
+    #[serde(default)]
+    pub user_added: bool,
 }
 
 /// Complete backup payload stored as JSON.

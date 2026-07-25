@@ -89,7 +89,11 @@ pub fn cmd_grant(
         }
     }
 
-    // ── Narrate: group ensure + user add (dry-run predicts; apply acts) ─
+    // ── Narrate: group ensure + user add ─────────────────────────────
+    // Narration only. The groupadd/gpasswd calls themselves happen inside
+    // the transaction below, after the backup exists — doing them here
+    // meant a later failure left account changes behind with no backup
+    // recording that they had been made.
     let group_existed = group_exists(&group_name);
     let user_in = user.map(|u| user_in_group(u, &group_name)).unwrap_or(true);
     narrate_action(
@@ -99,9 +103,6 @@ pub fn cmd_grant(
         "ensure group",
         &paint(Style::Group, &group_name),
     );
-    if !dry_run {
-        ensure_group(&group_name, false)?;
-    }
     if let Some(u) = user {
         narrate_action(
             stdout_tty,
@@ -115,13 +116,20 @@ pub fn cmd_grant(
                 paint(Style::Group, &group_name)
             ),
         );
-        if !dry_run {
-            add_user_to_group(u, &group_name, false)?;
-        }
     }
 
     // Build list of paths to touch.
     let chain = path_chain(&target, Path::new("/"));
+    // `/` has no chain: path_chain stops at the root, so there is no target
+    // segment to grant on. Refuse before anything mutates rather than
+    // panicking on an empty chain further down.
+    if chain.is_empty() {
+        return Err(PmError::Other(format!(
+            "refusing to grant on {}: it has no parent chain to make traversable\n       \
+             (grant on a specific path inside it instead)",
+            target.display()
+        )));
+    }
     let parents = if let Some(n) = max_level {
         let all_parents = &chain[..chain.len().saturating_sub(1)];
         let start = all_parents.len().saturating_sub(n);
@@ -174,6 +182,8 @@ pub fn cmd_grant(
 
     with_lock(|| {
         // Single backup covering parents + target + recursive descendants.
+        // It also records which account changes this grant is about to make,
+        // so `restore` / `undo` can take them back out again.
         let mut backup_id: Option<String> = None;
         if !dry_run {
             let snap = snapshot_with_acl(&all_paths, capture_acl)?;
@@ -187,8 +197,16 @@ pub fn cmd_grant(
                 max_level,
                 recursive: Some(recursive),
                 parent_op: None,
+                group_created: !group_existed,
+                user_added: !user_in,
             };
             backup_id = Some(save_backup(snap, op)?);
+
+            // Only now, with the backup on disk, touch the account database.
+            ensure_group(&group_name, false)?;
+            if let Some(u) = user {
+                add_user_to_group(u, &group_name, false)?;
+            }
         }
 
         // Parents: exactly `x` (traverse), replace existing group triad.
@@ -418,6 +436,8 @@ pub fn cmd_backup(path: &str, recursive: bool, capture_acl: bool) -> Result<()> 
                 max_level: None,
                 recursive: Some(recursive),
                 parent_op: None,
+                group_created: false,
+                user_added: false,
             },
         )?;
         println!("backup: {bid}  ({count} entries)");
@@ -583,7 +603,9 @@ fn restore_with_preview(
         for e in &data.entries {
             crate::locks::ensure_not_locked(&e.path)?;
         }
-        Ok(apply_restore(&data.entries, dry_run, skip_missing))
+        let mut errors = apply_restore(&data.entries, dry_run, skip_missing);
+        errors += revert_account_changes(&data.operation, dry_run);
+        Ok(errors)
     })?;
     if errors > 0 {
         return Err(PmError::Other(format!("{errors} error(s) during restore")));
@@ -608,6 +630,48 @@ fn restore_with_preview(
         println!("backup: {}", data.id);
     }
     Ok(())
+}
+
+/// Undo the group membership and group creation a `grant` performed.
+///
+/// A grant is two things: file metadata and account bookkeeping. Restoring
+/// only the former left the user inside the managed group forever, so the
+/// access the grant handed out survived its own "full revert". Only changes
+/// this backup recorded making are undone, and `delete_managed_group`
+/// refuses anything that is not a `pm_` group.
+///
+/// Returns the number of failures, so they land in the restore error count.
+fn revert_account_changes(op: &crate::types::Operation, dry_run: bool) -> u32 {
+    let mut errors = 0u32;
+    let group = match &op.group {
+        Some(g) if op.user_added || op.group_created => g,
+        _ => return 0,
+    };
+    if op.user_added {
+        if let Some(u) = &op.user {
+            if dry_run {
+                println!("[dry-run] gpasswd -d {u} {group}");
+            } else if let Err(e) = remove_user_from_group(u, group, false) {
+                eprintln!("error removing {u} from {group}: {e}");
+                errors += 1;
+            }
+        }
+    }
+    if op.group_created {
+        if dry_run {
+            println!("[dry-run] groupdel {group}");
+        } else {
+            match crate::groups::delete_managed_group(group) {
+                Ok(true) => println!("removed group {group}"),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("error deleting group {group}: {e}");
+                    errors += 1;
+                }
+            }
+        }
+    }
+    errors
 }
 
 fn format_op_summary(op: &crate::types::Operation) -> String {

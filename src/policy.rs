@@ -139,6 +139,8 @@ pub fn cmd_policy_apply(file: &str, dry_run: bool) -> Result<()> {
                     max_level: None,
                     recursive: Some(false),
                     parent_op: None,
+                    group_created: false,
+                    user_added: false,
                 },
             )?;
             println!("backup: {bid}");
