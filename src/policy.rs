@@ -60,11 +60,53 @@ fn load(file: &str) -> Result<Policy> {
     serde_yaml::from_str::<Policy>(&text).map_err(|e| PmError::Other(format!("parse {file}: {e}")))
 }
 
+/// Resolved `(uid, gid)` for a rule; either half may be absent.
+type ChownTarget = (Option<u32>, Option<u32>);
+
 struct Plan<'a> {
     rule: &'a Rule,
     mode: Option<String>, // resolved mode spec (octal str)
-    chown: Option<(Option<u32>, Option<u32>)>,
+    chown: Option<ChownTarget>,
     paths: Vec<PathBuf>,
+}
+
+/// Resolve one rule into the mode spec and (uid, gid) it demands.
+///
+/// `apply` and `verify` share this on purpose. They used to interpret rules
+/// differently — verify accepted `preset` together with `mode` (which apply
+/// rejects) and silently ignored owners and groups that do not exist,
+/// because a failed lookup collapsed into `None`. A compliance check that
+/// answers OK for a policy that cannot be applied, or that never checked
+/// ownership at all, is worse than no check.
+fn resolve_rule(r: &Rule) -> Result<(Option<String>, Option<ChownTarget>)> {
+    let mode = match (&r.preset, &r.mode) {
+        (Some(_), Some(_)) => {
+            return Err(PmError::Other(format!(
+                "policy rule for {:?}: `preset` and `mode` are mutually exclusive",
+                r.path
+            )));
+        }
+        (Some(p), None) => Some(resolve_preset(p)?.to_string()),
+        (None, Some(m)) => {
+            // Validate the octal now so bad input fails before mutation.
+            parse_octal(m)?;
+            Some(m.clone())
+        }
+        (None, None) => None,
+    };
+    let chown = match (&r.owner, &r.group) {
+        (None, None) => None,
+        (u, g) => {
+            let spec = match (u, g) {
+                (Some(u), Some(g)) => format!("{u}:{g}"),
+                (Some(u), None) => u.clone(),
+                (None, Some(g)) => format!(":{g}"),
+                (None, None) => unreachable!(),
+            };
+            Some(resolve_chown_target(&spec, None)?)
+        }
+    };
+    Ok((mode, chown))
 }
 
 pub fn cmd_policy_apply(file: &str, dry_run: bool) -> Result<()> {
@@ -78,33 +120,7 @@ pub fn cmd_policy_apply(file: &str, dry_run: bool) -> Result<()> {
         let ex = ExcludeSet::new(&r.exclude)?;
         let paths_in = vec![r.path.clone()];
         let (_, paths) = expand_targets(&paths_in, r.recursive, &ex)?;
-        let mode = match (&r.preset, &r.mode) {
-            (Some(_), Some(_)) => {
-                return Err(PmError::Other(format!(
-                    "policy rule for {:?}: `preset` and `mode` are mutually exclusive",
-                    r.path
-                )));
-            }
-            (Some(p), None) => Some(resolve_preset(p)?.to_string()),
-            (None, Some(m)) => {
-                // Validate the octal now so bad input fails before mutation.
-                parse_octal(m)?;
-                Some(m.clone())
-            }
-            (None, None) => None,
-        };
-        let chown = match (&r.owner, &r.group) {
-            (None, None) => None,
-            (u, g) => {
-                let spec = match (u, g) {
-                    (Some(u), Some(g)) => format!("{u}:{g}"),
-                    (Some(u), None) => u.clone(),
-                    (None, Some(g)) => format!(":{g}"),
-                    (None, None) => unreachable!(),
-                };
-                Some(resolve_chown_target(&spec, None)?)
-            }
-        };
+        let (mode, chown) = resolve_rule(r)?;
         union.extend(paths.iter().cloned());
         plans.push(Plan {
             rule: r,
@@ -183,25 +199,13 @@ pub fn cmd_policy_verify(file: &str) -> Result<()> {
 fn verify_rule(r: &Rule) -> Result<usize> {
     let target = resolve_path(&r.path)?;
     let ex = ExcludeSet::new(&r.exclude)?;
-    // Resolve expected mode. `preset` beats `mode` semantically should not both exist;
-    // if both are set we verify against `mode` to match `apply`'s own check.
-    let expected_mode: Option<u32> = match (&r.preset, &r.mode) {
-        (_, Some(m)) => Some(parse_octal(m)?),
-        (Some(p), None) => Some(parse_octal(resolve_preset(p)?)?),
-        (None, None) => None,
-    };
-    let expected_uid = r.owner.as_deref().and_then(|n| {
-        nix::unistd::User::from_name(n)
-            .ok()
-            .flatten()
-            .map(|u| u.uid)
-    });
-    let expected_gid = r.group.as_deref().and_then(|n| {
-        nix::unistd::Group::from_name(n)
-            .ok()
-            .flatten()
-            .map(|g| g.gid)
-    });
+    // Same resolution apply uses, so verify can never bless a rule apply
+    // would refuse, and a missing user/group is an error rather than a
+    // silently skipped check.
+    let (mode_spec, chown) = resolve_rule(r)?;
+    let expected_mode: Option<u32> = mode_spec.as_deref().map(parse_octal).transpose()?;
+    let expected_uid = chown.and_then(|(u, _)| u).map(Uid::from_raw);
+    let expected_gid = chown.and_then(|(_, g)| g).map(Gid::from_raw);
     let mut drift = 0usize;
     let mut check = |p: &std::path::Path| {
         if ex.is_excluded(p) {
@@ -211,6 +215,12 @@ fn verify_rule(r: &Rule) -> Result<usize> {
             Ok(m) => m,
             Err(_) => return,
         };
+        // apply skips symlinks (their mode bits are fixed at 0777 on Linux
+        // and ignored by the kernel), so verifying them reported drift that
+        // no amount of applying could ever clear.
+        if md.file_type().is_symlink() {
+            return;
+        }
         let mode = md.permissions().mode() & 0o7777;
         if let Some(em) = expected_mode {
             if mode != em {

@@ -1,6 +1,6 @@
 //! `compare A B`: report differences in mode/owner/group/ACL.
 
-use crate::acl::has_extended_acl;
+use crate::acl::{has_extended_acl, normalize_acl, read_acl_pair};
 use crate::errors::Result;
 use crate::helpers::resolve_path;
 use crate::render::{self, paint, Style};
@@ -15,8 +15,17 @@ struct Snap {
     mode: u32,
     uid: u32,
     gid: u32,
-    acl: bool,
+    /// Normalized ACL entries, not just "has one". Comparing presence made
+    /// `nobody:r--` and `nobody:rw-` report as identical.
+    acl: Vec<String>,
+    default_acl: Vec<String>,
     kind: char,
+}
+
+impl Snap {
+    fn has_acl(&self) -> bool {
+        !self.acl.is_empty() || !self.default_acl.is_empty()
+    }
 }
 
 fn snap(p: &Path) -> Option<Snap> {
@@ -28,11 +37,23 @@ fn snap(p: &Path) -> Option<Snap> {
     } else {
         'f'
     };
+    // Only non-trivial ACLs are worth recording: every file reports
+    // user::/group::/other:: entries that merely echo the mode.
+    let (acl, default_acl) = if has_extended_acl(p) {
+        let (a, d) = read_acl_pair(p);
+        (
+            a.as_deref().map(normalize_acl).unwrap_or_default(),
+            d.as_deref().map(normalize_acl).unwrap_or_default(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     Some(Snap {
         mode: md.permissions().mode() & 0o7777,
         uid: md.uid(),
         gid: md.gid(),
-        acl: has_extended_acl(p),
+        acl,
+        default_acl,
         kind,
     })
 }
@@ -49,8 +70,34 @@ fn fmt_snap_kv(s: &Snap) -> String {
         s.mode,
         crate::users::uid_to_name(Uid::from_raw(s.uid)),
         crate::users::gid_to_name(Gid::from_raw(s.gid)),
-        if s.acl { "  +acl" } else { "" }
+        if s.has_acl() { "  +acl" } else { "" }
     )
+}
+
+/// Print the ACL entries that exist on only one side.
+fn print_acl_delta(x: &Snap, y: &Snap) {
+    let pairs = [
+        ("acl", &x.acl, &y.acl),
+        ("default", &x.default_acl, &y.default_acl),
+    ];
+    for (label, a, b) in pairs {
+        for entry in a.iter().filter(|e| !b.contains(e)) {
+            println!(
+                "      {}  {} {}",
+                paint(Style::Label, &format!("{label}:")),
+                paint(Style::Deny, "only in A"),
+                paint(Style::Primary, entry)
+            );
+        }
+        for entry in b.iter().filter(|e| !a.contains(e)) {
+            println!(
+                "      {}  {} {}",
+                paint(Style::Label, &format!("{label}:")),
+                paint(Style::Ok, "only in B"),
+                paint(Style::Primary, entry)
+            );
+        }
+    }
 }
 
 fn collect(root: &Path, recursive: bool) -> Result<BTreeMap<PathBuf, Snap>> {
@@ -122,6 +169,12 @@ pub fn cmd_compare(a: &str, b: &str, recursive: bool) -> Result<()> {
                     paint(Style::Label, "B:"),
                     paint(Style::Label, &fmt_snap_kv(y))
                 );
+                // Mode/owner already print above; without this an ACL-only
+                // difference shows two identical-looking lines flagged as
+                // changed, with no way to see what actually differs.
+                if x.acl != y.acl || x.default_acl != y.default_acl {
+                    print_acl_delta(x, y);
+                }
             }
             (Some(x), None) => {
                 only_a += 1;

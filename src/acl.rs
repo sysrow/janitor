@@ -282,6 +282,43 @@ pub fn acl_strip(path: &Path, recursive: bool, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// Canonical form of an ACL text for comparison.
+///
+/// `getfacl` output is not stable enough to diff as a string: it carries
+/// `# file:` headers, blank lines and `#effective:` annotations, and entry
+/// order is not guaranteed. Strip the commentary and sort what is left, so
+/// two ACLs compare equal exactly when they grant the same thing.
+pub fn normalize_acl(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    lines.sort();
+    lines.dedup();
+    lines
+}
+
+/// True when two captured ACL texts describe different permissions.
+/// `None` and an ACL that normalizes to nothing are treated as equal.
+pub fn acl_text_differs(a: Option<&str>, b: Option<&str>) -> bool {
+    let na = a.map(normalize_acl).unwrap_or_default();
+    let nb = b.map(normalize_acl).unwrap_or_default();
+    na != nb
+}
+
+/// Read both ACLs of a path for comparison purposes.
+/// Returns `(access, default)`; unreadable ACLs come back as `None`.
+pub fn read_acl_pair(path: &Path) -> (Option<String>, Option<String>) {
+    let access = get_acl(path).ok().flatten();
+    let default = if path.is_dir() {
+        get_default_acl(path).ok().flatten()
+    } else {
+        None
+    };
+    (access, default)
+}
+
 /// Check if a path has any non-trivial ACL entries beyond the base mode.
 pub fn has_extended_acl(path: &Path) -> bool {
     match get_acl(path) {

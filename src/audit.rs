@@ -43,6 +43,56 @@ pub struct AuditFilter<'a> {
     pub no_group: bool,
 }
 
+/// Outcome of one filesystem scan.
+pub struct ScanResult {
+    pub hits: Vec<AuditHit>,
+    pub pseudo_skipped: usize,
+    /// Entries the walk could not read. A security scan that cannot see part
+    /// of the tree must say so: reporting "no matches" for a subtree it never
+    /// entered is the one answer an audit must never give.
+    pub unreadable: Vec<String>,
+}
+
+impl ScanResult {
+    /// Print the unreadable-path summary and return true if the scan was
+    /// incomplete. `best_effort` downgrades it to a warning.
+    pub fn report_incomplete(&self, best_effort: bool) -> bool {
+        if self.unreadable.is_empty() {
+            return false;
+        }
+        let shown = self.unreadable.iter().take(10);
+        for p in shown {
+            eprintln!("  {} {p}", paint(Style::Danger, "unreadable"));
+        }
+        if self.unreadable.len() > 10 {
+            eprintln!("  … and {} more", self.unreadable.len() - 10);
+        }
+        eprintln!(
+            "{} scan incomplete: {} path(s) could not be read{}",
+            paint(Style::Danger, "error:"),
+            self.unreadable.len(),
+            if best_effort {
+                " (continuing: --best-effort)"
+            } else {
+                " (results below cover only what was reachable)"
+            }
+        );
+        !best_effort
+    }
+}
+
+/// Turn an incomplete scan into a non-zero exit.
+fn incomplete_result(incomplete: bool) -> Result<()> {
+    if incomplete {
+        return Err(crate::errors::PmError::Other(
+            "scan incomplete — rerun with sufficient privileges, or pass --best-effort to \
+             accept partial results"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Low-level scan: returns matching hits. Shared by `audit`, `find`, and
 /// `audit --fix`.
 ///
@@ -50,15 +100,19 @@ pub struct AuditFilter<'a> {
 /// (/proc /sys /dev cgroupfs tmpfs etc. — see `helpers::is_pseudo_fs`)
 /// are skipped. Callers that need raw inode listings (policy audits on
 /// /proc, for example) can opt back in.
+///
+/// Paths the walk cannot read are collected rather than dropped, so callers
+/// can refuse to present a partial scan as a clean one.
 pub fn scan(
     path: &Path,
     filter: &AuditFilter,
     exclude: &ExcludeSet,
     include_pseudo: bool,
     probe_acl: bool,
-) -> (Vec<AuditHit>, usize) {
+) -> ScanResult {
     let mut hits: Vec<AuditHit> = Vec::new();
     let mut pseudo_skipped = 0usize;
+    let mut unreadable: Vec<String> = Vec::new();
     let root_dev = std::fs::symlink_metadata(path)
         .map(|m| m.dev())
         .unwrap_or(0);
@@ -82,11 +136,21 @@ pub fn scan(
             }
             true
         });
-    for entry in walker.filter_map(|e| e.ok()) {
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                unreadable.push(describe_walk_error(&e));
+                continue;
+            }
+        };
         let p = entry.path();
         let md = match entry.metadata() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                unreadable.push(format!("{}: {e}", p.display()));
+                continue;
+            }
         };
         let mode = md.mode() & 0o7777;
         let uid = md.uid();
@@ -184,7 +248,19 @@ pub fn scan(
             size: md.len(),
         });
     }
-    (hits, pseudo_skipped)
+    ScanResult {
+        hits,
+        pseudo_skipped,
+        unreadable,
+    }
+}
+
+/// walkdir errors may or may not carry a path; keep whichever we get.
+fn describe_walk_error(e: &walkdir::Error) -> String {
+    match e.path() {
+        Some(p) => format!("{}: {e}", p.display()),
+        None => e.to_string(),
+    }
 }
 
 pub fn cmd_audit(
@@ -195,27 +271,30 @@ pub fn cmd_audit(
     include_pseudo: bool,
     paths_only: bool,
     print0: bool,
+    best_effort: bool,
 ) -> Result<()> {
     let root = resolve_path(path)?;
     let t0 = Instant::now();
     // Pipe-pure path output has no ACL column and no ACL filter ==> no
     // need to issue the per-file lgetxattr syscall.
     let probe_acl = !(paths_only || print0) || filter.has_acl;
-    let (hits, pseudo_skipped) = scan(&root, filter, exclude, include_pseudo, probe_acl);
+    let result = scan(&root, filter, exclude, include_pseudo, probe_acl);
+    let hits = &result.hits;
     let elapsed_ms = t0.elapsed().as_millis();
-    if pseudo_skipped > 0 {
+    if result.pseudo_skipped > 0 {
         eprintln!(
             "info: skipped {} pseudo-filesystem mount point(s) (use --include-pseudo to include)",
-            pseudo_skipped
+            result.pseudo_skipped
         );
     }
+    let incomplete = result.report_incomplete(best_effort);
 
     if as_json {
         println!(
             "{}",
             serde_json::to_string_pretty(&hits).unwrap_or_else(|_| "[]".into())
         );
-        return Ok(());
+        return incomplete_result(incomplete);
     }
 
     // Pipe-pure path output. No header, no colors, no summary on
@@ -226,11 +305,11 @@ pub fn cmd_audit(
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         let sep: u8 = if print0 { 0 } else { b'\n' };
-        for h in &hits {
+        for h in hits {
             let _ = out.write_all(h.path.as_bytes());
             let _ = out.write_all(&[sep]);
         }
-        return Ok(());
+        return incomplete_result(incomplete);
     }
 
     // ── Counters for summary (stderr) ────────────────────────────────
@@ -240,7 +319,7 @@ pub fn cmd_audit(
     let mut c_ww = 0u32;
     let mut c_wr = 0u32;
     let mut c_acl = 0u32;
-    for h in &hits {
+    for h in hits {
         let m = u32::from_str_radix(&h.mode, 8).unwrap_or(0);
         if m & 0o4000 != 0 {
             c_setuid += 1;
@@ -270,13 +349,13 @@ pub fn cmd_audit(
                 &format!("(no matches — scanned in {} ms)", elapsed_ms)
             )
         );
-        return Ok(());
+        return incomplete_result(incomplete);
     }
 
     // ── Render table via render::aligned_table ───────────────────────
     let header = &["mode", "user", "group", "acl", "size", "path", "flags"];
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(hits.len());
-    for h in &hits {
+    for h in hits {
         let m = u32::from_str_radix(&h.mode, 8).unwrap_or(0);
         // Paint `mode` cell so each row makes the filter-match reason
         // visible at a glance:
@@ -351,7 +430,7 @@ pub fn cmd_audit(
     all.push_str("  ");
     all.push_str(&paint(Style::Label, &format!("{ms} ms")));
     eprintln!("{all}");
-    Ok(())
+    incomplete_result(incomplete)
 }
 
 /// `audit --fix ACTION`: find + mutate in one transaction.
@@ -362,15 +441,20 @@ pub fn cmd_audit_fix(
     action: &str,
     dry_run: bool,
     include_pseudo: bool,
+    best_effort: bool,
 ) -> Result<()> {
     let root = resolve_path(path)?;
-    let (hits, pseudo_skipped) = scan(&root, filter, exclude, include_pseudo, true);
-    if pseudo_skipped > 0 {
+    let result = scan(&root, filter, exclude, include_pseudo, true);
+    let hits = &result.hits;
+    if result.pseudo_skipped > 0 {
         eprintln!(
             "info: skipped {} pseudo-filesystem mount point(s) (use --include-pseudo to include)",
-            pseudo_skipped
+            result.pseudo_skipped
         );
     }
+    // Fixing based on a partial scan is worse than fixing nothing: it leaves
+    // the unreachable half untouched while reporting the run as done.
+    incomplete_result(result.report_incomplete(best_effort))?;
     if hits.is_empty() {
         println!("(no matches; nothing to fix)");
         return Ok(());
@@ -409,7 +493,12 @@ pub fn cmd_audit_fix(
 }
 
 /// `find-orphans`: files with non-existent owner/group.
-pub fn cmd_find_orphans(path: &str, as_json: bool, include_pseudo: bool) -> Result<()> {
+pub fn cmd_find_orphans(
+    path: &str,
+    as_json: bool,
+    include_pseudo: bool,
+    best_effort: bool,
+) -> Result<()> {
     let root = resolve_path(path)?;
     let t0 = Instant::now();
     let mut hits: Vec<(AuditHit, &'static str)> = Vec::new();
@@ -434,11 +523,22 @@ pub fn cmd_find_orphans(path: &str, as_json: bool, include_pseudo: bool) -> Resu
             }
             true
         });
-    for entry in walker.filter_map(|e| e.ok()) {
+    let mut unreadable: Vec<String> = Vec::new();
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                unreadable.push(describe_walk_error(&e));
+                continue;
+            }
+        };
         let p = entry.path();
         let md = match entry.metadata() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                unreadable.push(format!("{}: {e}", p.display()));
+                continue;
+            }
         };
         let uid = md.uid();
         let gid = md.gid();
@@ -472,13 +572,22 @@ pub fn cmd_find_orphans(path: &str, as_json: bool, include_pseudo: bool) -> Resu
         );
     }
 
+    let incomplete = incomplete_result(
+        ScanResult {
+            hits: Vec::new(),
+            pseudo_skipped,
+            unreadable,
+        }
+        .report_incomplete(best_effort),
+    );
+
     if as_json {
         let simple: Vec<&AuditHit> = hits.iter().map(|(h, _)| h).collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&simple).unwrap_or_else(|_| "[]".into())
         );
-        return Ok(());
+        return incomplete;
     }
 
     if hits.is_empty() {
@@ -493,7 +602,7 @@ pub fn cmd_find_orphans(path: &str, as_json: bool, include_pseudo: bool) -> Resu
                 )
             )
         );
-        return Ok(());
+        return incomplete;
     }
 
     let header = &["mode", "owner", "group", "orphan", "size", "path"];
@@ -518,7 +627,7 @@ pub fn cmd_find_orphans(path: &str, as_json: bool, include_pseudo: bool) -> Resu
         "tip: fix with `janitor chown <user>:<group> PATH [...]`",
     ));
     eprintln!("{summary}");
-    Ok(())
+    incomplete
 }
 
 // keep Path import alive

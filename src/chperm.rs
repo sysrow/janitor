@@ -267,17 +267,45 @@ pub fn parse_octal(s: &str) -> Result<u32> {
         })
 }
 
+/// The process umask, read once.
+///
+/// There is no way to *read* the umask without setting it, so this does the
+/// standard set-and-restore dance. It runs from `main` before any file is
+/// created, and the result is cached, so no other thread can observe the
+/// momentary change.
+pub fn process_umask() -> u32 {
+    use nix::sys::stat::{umask, Mode};
+    use std::sync::OnceLock;
+    static UMASK: OnceLock<u32> = OnceLock::new();
+    *UMASK.get_or_init(|| {
+        let current = umask(Mode::from_bits_truncate(0o022));
+        umask(current);
+        current.bits() as u32 & 0o777
+    })
+}
+
 /// Apply symbolic mode like "u+r", "g-w", "o=rx", "a+X", "u+s".
 /// Returns the new mode given the current one.
 pub fn apply_symbolic(current: u32, spec: &str, is_dir: bool) -> Result<u32> {
+    apply_symbolic_with_umask(current, spec, is_dir, process_umask())
+}
+
+/// `apply_symbolic` with the umask supplied explicitly, so tests are not at
+/// the mercy of whatever umask the shell running them happened to have.
+pub fn apply_symbolic_with_umask(
+    current: u32,
+    spec: &str,
+    is_dir: bool,
+    umask: u32,
+) -> Result<u32> {
     let mut mode = current & 0o7777;
     for part in spec.split(',') {
-        mode = apply_one(mode, part.trim(), is_dir)?;
+        mode = apply_one(mode, part.trim(), is_dir, umask)?;
     }
     Ok(mode)
 }
 
-fn apply_one(mut mode: u32, spec: &str, is_dir: bool) -> Result<u32> {
+fn apply_one(mut mode: u32, spec: &str, is_dir: bool, umask: u32) -> Result<u32> {
     // Split into whos and op+perms.
     let op_pos = spec
         .find(|c: char| ['+', '-', '='].contains(&c))
@@ -287,7 +315,14 @@ fn apply_one(mut mode: u32, spec: &str, is_dir: bool) -> Result<u32> {
     let perms = &rest[1..];
 
     let mut who_mask: u32 = 0;
-    if whos.is_empty() || whos.contains('a') {
+    if whos.is_empty() {
+        // POSIX: with no `who`, the effect is as if `a` were given "except
+        // that bits in the file mode creation mask are not affected". So
+        // `umask 077; chmod +x f` sets only u+x, matching coreutils.
+        // An explicit `a` ignores the umask, which is the whole point of
+        // spelling it out.
+        who_mask |= 0o777 & !umask;
+    } else if whos.contains('a') {
         who_mask |= 0o700 | 0o070 | 0o007;
     } else {
         for c in whos.chars() {
@@ -805,13 +840,34 @@ mod tests {
         assert_eq!(apply_symbolic(0o777, "o=", false).unwrap(), 0o770);
     }
 
+    /// POSIX: an omitted `who` behaves like `a` "except that bits in the
+    /// file mode creation mask are not affected". With umask 0 that is
+    /// literally a+x; with a real umask, coreutils drops the masked bits.
     #[test]
-    fn sym_empty_who_means_all() {
-        // "+x" (no who) adds x to all — equivalent to a+x
-        assert_eq!(apply_symbolic(0o644, "+x", false).unwrap(), 0o755);
-        // "=r" on 0o777 clears everything and sets read for all
-        // (also clears suid/sgid/sticky)
-        assert_eq!(apply_symbolic(0o7777, "=r", false).unwrap(), 0o444);
+    fn sym_empty_who_means_all_minus_umask() {
+        assert_eq!(
+            apply_symbolic_with_umask(0o644, "+x", false, 0o000).unwrap(),
+            0o755
+        );
+        assert_eq!(
+            apply_symbolic_with_umask(0o7777, "=r", false, 0o000).unwrap(),
+            0o444
+        );
+        // umask 077: only the owner triad is affected (the §M-07 case).
+        assert_eq!(
+            apply_symbolic_with_umask(0o600, "+x", false, 0o077).unwrap(),
+            0o700
+        );
+        // umask 022: group and other keep their write bits untouched.
+        assert_eq!(
+            apply_symbolic_with_umask(0o666, "-w", false, 0o022).unwrap(),
+            0o466
+        );
+        // An explicit `a` ignores the umask entirely.
+        assert_eq!(
+            apply_symbolic_with_umask(0o600, "a+x", false, 0o077).unwrap(),
+            0o711
+        );
     }
 
     #[test]

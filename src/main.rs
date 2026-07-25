@@ -73,6 +73,11 @@ fn main() {
     })
     .ok();
 
+    // Cache the umask before anything creates a file. Reading it requires
+    // temporarily setting it, so this has to happen while we are still
+    // single-threaded and have not touched the filesystem.
+    chperm::process_umask();
+
     let cli = Cli::parse();
     // Presentation layer init. Color respects --color on commands that
     // carry it (currently `tree`), otherwise follows autodetect (NO_COLOR,
@@ -234,6 +239,7 @@ fn run(cli: Cli) -> errors::Result<()> {
             fix,
             paths,
             print0,
+            best_effort,
         } => {
             let mode_num = match mode {
                 Some(s) => Some(chperm::parse_octal(&s)?),
@@ -257,16 +263,32 @@ fn run(cli: Cli) -> errors::Result<()> {
             };
             let ex = matcher::ExcludeSet::new(&exclude)?;
             match fix {
-                Some(action) => {
-                    audit::cmd_audit_fix(&path, &filter, &ex, &action, dry_run, include_pseudo)
-                }
-                None => audit::cmd_audit(&path, &filter, &ex, json, include_pseudo, paths, print0),
+                Some(action) => audit::cmd_audit_fix(
+                    &path,
+                    &filter,
+                    &ex,
+                    &action,
+                    dry_run,
+                    include_pseudo,
+                    best_effort,
+                ),
+                None => audit::cmd_audit(
+                    &path,
+                    &filter,
+                    &ex,
+                    json,
+                    include_pseudo,
+                    paths,
+                    print0,
+                    best_effort,
+                ),
             }
         }
         Command::FindOrphans {
             path,
             include_pseudo,
-        } => audit::cmd_find_orphans(&path, json, include_pseudo),
+            best_effort,
+        } => audit::cmd_find_orphans(&path, json, include_pseudo, best_effort),
         Command::WhoCan { path } => whocan::cmd_who_can(&path, json),
         Command::Info { path, for_user } => info::cmd_info(&path, for_user.as_deref()),
         Command::Acl(sub) => match sub {

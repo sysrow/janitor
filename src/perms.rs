@@ -6,7 +6,7 @@ use std::path::Path;
 
 use nix::unistd::{Gid, Uid};
 
-use crate::acl::restore_acl;
+use crate::acl::{acl_text_differs, read_acl_pair, restore_acl};
 use crate::errors::{PmError, Result};
 use crate::render::{paint, Style};
 use crate::types::{AccessBits, SnapEntry};
@@ -50,7 +50,18 @@ pub fn preview_restore(entries: &[SnapEntry]) -> Vec<String> {
         let mode_diff = cur_mode != rec_mode && !e.is_symlink;
         let uid_diff = cur_uid != e.uid;
         let gid_diff = cur_gid != e.gid;
-        if !mode_diff && !uid_diff && !gid_diff {
+        // ACLs have to be part of the preview, not just of the apply. The
+        // caller gates its confirmation prompt (and its refusal to run
+        // unattended without --yes) on this list being non-empty, so an
+        // ACL-only restore used to slip through both.
+        let acl_diff = if e.acl.is_some() || e.default_acl.is_some() {
+            let (cur_acl, cur_default) = read_acl_pair(&e.path);
+            acl_text_differs(e.acl.as_deref(), cur_acl.as_deref())
+                || acl_text_differs(e.default_acl.as_deref(), cur_default.as_deref())
+        } else {
+            false
+        };
+        if !mode_diff && !uid_diff && !gid_diff && !acl_diff {
             continue;
         }
         let mut line = format!("  {}", paint(Style::Primary, &e.path.display().to_string()));
@@ -74,6 +85,12 @@ pub fn preview_restore(entries: &[SnapEntry]) -> Vec<String> {
                 paint(Style::Separator, "→"),
                 paint(Style::User, &ru),
                 paint(Style::Group, &rg)
+            ));
+        }
+        if acl_diff {
+            line.push_str(&format!(
+                "\n      acl    {}",
+                paint(Style::Label, "differs from snapshot")
             ));
         }
         out.push(line);

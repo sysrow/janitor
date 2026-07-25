@@ -424,6 +424,11 @@ Common recipes:\n  \
         /// `janitor chmod --stdin0 ...` for safe handling of odd names.
         #[arg(short = '0', long = "print0", conflicts_with_all = ["fix"])]
         print0: bool,
+        /// Report unreadable paths but still exit 0. Without this, a scan
+        /// that could not read part of the tree is an error, since a clean
+        /// result would otherwise cover only what happened to be reachable.
+        #[arg(long)]
+        best_effort: bool,
     },
 
     /// Find files whose UID or GID is not in /etc/passwd or /etc/group.
@@ -433,6 +438,9 @@ Common recipes:\n  \
         /// Descend into pseudo-filesystems (/proc, /sys, /dev, cgroup, …).
         #[arg(long = "include-pseudo")]
         include_pseudo: bool,
+        /// Report unreadable paths but still exit 0 (see `audit --best-effort`).
+        #[arg(long)]
+        best_effort: bool,
     },
 
     /// Reverse access query: which users can read / write / exec PATH.

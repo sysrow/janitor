@@ -66,9 +66,14 @@ pub fn cmd_who_can(path: &str, as_json: bool) -> Result<()> {
 
     for u in &users {
         if u.name == "root" || u.uid == 0 {
+            // root bypasses read and write permission checks, but *not*
+            // execute: the kernel still requires at least one x bit on a
+            // regular file (see generic_permission / MAY_EXEC). Claiming
+            // root can run a 0600 file was simply wrong.
             read_bkt.root = true;
             write_bkt.root = true;
-            exec_bkt.root = true;
+            let is_dir = md.is_dir();
+            exec_bkt.root = is_dir || (mode & 0o111) != 0;
             continue;
         }
         let d = match effective_for_user_path(&target, &u.name) {
@@ -209,8 +214,16 @@ fn classify_into(b: &mut Buckets, user: &str, reason: &str) {
     }
 }
 
+/// Flatten a bucket for the JSON report.
+///
+/// root is tracked in its own field rather than in the name lists, and used
+/// to be dropped here — so `who-can --json` on a 0600 file listed only the
+/// owner and quietly omitted the one account that can always read it.
 fn sorted_flat(b: &Buckets) -> Vec<String> {
     let mut all: BTreeSet<String> = BTreeSet::new();
+    if b.root {
+        all.insert("root".to_string());
+    }
     all.extend(b.owner.iter().cloned());
     all.extend(b.group.iter().cloned());
     all.extend(b.other.iter().cloned());

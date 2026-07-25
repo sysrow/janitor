@@ -7,6 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use nix::unistd::{Gid, Uid};
 use serde::Serialize;
 
+use crate::acl::{acl_text_differs, read_acl_pair};
 use crate::backup::load_backup;
 use crate::errors::Result;
 use crate::render::{paint, Style};
@@ -37,7 +38,18 @@ pub fn cmd_diff(backup_id: &str, as_json: bool) -> Result<()> {
         let mode_differs = cur_mode.map(|m| m != e.perm).unwrap_or(true);
         let uid_differs = cur_uid.map(|u| u != e.uid).unwrap_or(true);
         let gid_differs = cur_gid.map(|g| g != e.gid).unwrap_or(true);
-        let acl_differs = e.acl.is_some() || e.default_acl.is_some();
+        // Compare the captured ACL against the live one. Flagging "changed"
+        // whenever the snapshot merely *had* an ACL made every entry look
+        // dirty — `getfacl -c` emits base entries for every file — so an
+        // immediate backup-then-diff reported changes on an untouched tree
+        // and the output was useless as a drift gate.
+        let acl_differs = if cur.is_some() && (e.acl.is_some() || e.default_acl.is_some()) {
+            let (cur_acl, cur_default) = read_acl_pair(&e.path);
+            acl_text_differs(e.acl.as_deref(), cur_acl.as_deref())
+                || acl_text_differs(e.default_acl.as_deref(), cur_default.as_deref())
+        } else {
+            false
+        };
         if !mode_differs && !uid_differs && !gid_differs && !acl_differs {
             continue;
         }
