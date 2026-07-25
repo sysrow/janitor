@@ -154,8 +154,28 @@ fn run(cli: Cli) -> errors::Result<()> {
             backup_id,
             yes,
             skip_missing,
-        } => commands::cmd_restore(&backup_id, dry_run, yes, skip_missing),
-        Command::Undo { yes, skip_missing } => commands::cmd_undo(dry_run, yes, skip_missing),
+            allow_replaced,
+        } => commands::cmd_restore(
+            &backup_id,
+            yes,
+            perms::RestoreOptions {
+                dry_run,
+                skip_missing,
+                allow_replaced,
+            },
+        ),
+        Command::Undo {
+            yes,
+            skip_missing,
+            allow_replaced,
+        } => commands::cmd_undo(
+            yes,
+            perms::RestoreOptions {
+                dry_run,
+                skip_missing,
+                allow_replaced,
+            },
+        ),
         Command::History { path, since } => commands::cmd_history(&path, since.as_deref(), json),
         Command::CopyPerms {
             src,

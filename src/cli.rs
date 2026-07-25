@@ -159,6 +159,10 @@ For partial (bit-level) revocation, use one of:\n  \
         /// Report paths that no longer exist as skipped instead of failing.
         #[arg(long)]
         skip_missing: bool,
+        /// Restore entries whose inode changed since the snapshot (e.g. a
+        /// file your editor rewrote). The file-type check still applies.
+        #[arg(long)]
+        allow_replaced: bool,
     },
 
     /// Undo the most recent backup (shortcut for `restore $(list-backups | head -1)`).
@@ -177,6 +181,10 @@ Combine with --dry-run to preview what would be reverted."
         /// Report paths that no longer exist as skipped instead of failing.
         #[arg(long)]
         skip_missing: bool,
+        /// Restore entries whose inode changed since the snapshot (e.g. a
+        /// file your editor rewrote). The file-type check still applies.
+        #[arg(long)]
+        allow_replaced: bool,
     },
 
     /// Show the backup history touching PATH (newest first).

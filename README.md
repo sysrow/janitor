@@ -185,8 +185,8 @@ single-letter equivalent.
 |---|---|
 | `grant` (`g`) `PATH [-u USER\|-g GROUP] [-r] [-w] [-x] [-R]` | Hierarchical grant with auto-snapshot. |
 | `revoke` (`rv`) `PATH -u USER` | Remove user from the managed group (all-or-nothing). |
-| `restore` (`r`) `ID [--yes] [--skip-missing]` | Full rollback of a specific backup, including the group membership a `grant` created. Refuses entries whose inode changed since the snapshot. `--skip-missing` tolerates paths that no longer exist. |
-| `undo` (`u`) `[--yes] [--skip-missing]` | Restore the most recent backup (one-shot revert of the last change). |
+| `restore` (`r`) `ID [--yes] [--skip-missing] [--allow-replaced]` | Full rollback of a specific backup, including the group membership a `grant` created. Refuses entries whose file type or inode changed since the snapshot; `--allow-replaced` accepts a new inode (an editor rewrite) while still refusing a type change. `--skip-missing` tolerates paths that no longer exist. |
+| `undo` (`u`) `[--yes] [--skip-missing] [--allow-replaced]` | Restore the most recent backup (one-shot revert of the last change). |
 | `tree` (`t`) `PATH [-L DEPTH] [-U USER] [-A] [-c WHEN]` | Colored permission tree. |
 | `chmod MODE PATH... [-R] [-F FILE] [-E GLOB] [--from-file FILE] [--stdin0]` | Octal (inc. `4755`/`2755`/`1777`/`6755` special bits) or symbolic (`u+s`, `g+s`, `+t`, `a+X`, ...), with auto-snapshot. Accepts many PATHs in one call (single snapshot) and can stream them from a file or NUL-separated stdin. `--reference FILE` copies the mode from another path. |
 | `chown SPEC PATH... [-R] [-F FILE] [-E GLOB] [--from-file FILE] [--stdin0]` | `user`, `user:group`, `:group`, `user:`, numeric `1000:1000`. Symlinks are always `lchown`-ed. Same mass-path / exclude / stdin options as `chmod`. |
@@ -453,7 +453,9 @@ Each snapshot contains mode, uid, gid, symlink-ness, inode identity (`dev`/`ino`
 
 Snapshotting is fail-closed: if a path cannot be stat'ed, or its ACL cannot be read on a filesystem that supports ACLs, the command aborts rather than mutating on top of a backup that cannot undo it. A missing `acl` package is not a failure — those entries are flagged as "not captured" and the run warns once.
 
-Restore is atomic per path, and refuses any entry whose file type or inode no longer matches the snapshot, so a path swapped for a symlink or hard link since the backup cannot redirect the change to another file:
+Restore is atomic per path, and refuses any entry whose file type or inode no longer matches the snapshot, so a path swapped for a symlink or hard link since the backup cannot redirect the change to another file.
+
+An ordinary editor save is write-then-rename, which also produces a new inode, so `restore` after editing a file reports it as replaced. Pass `--allow-replaced` when that is what happened; the file-type check still applies, so the symlink case stays blocked either way.
 
 ```sh
 janitor list-backups                 # list available snapshots

@@ -123,6 +123,9 @@ holes that made some changes unrevertible.
   rather than recording "no ACL".
 - `restore` refuses entries whose inode changed since the snapshot, which
   includes files legitimately replaced by an editor's write-and-rename.
+  Pass `--allow-replaced` for that case; it waives only the inode check,
+  never the file-type check, so a path swapped for a symlink is still
+  refused.
 
 ### Known limitations
 

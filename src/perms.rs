@@ -98,28 +98,42 @@ pub fn preview_restore(entries: &[SnapEntry]) -> Vec<String> {
     out
 }
 
+/// How strict `apply_restore` is about the state it finds on disk.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RestoreOptions {
+    pub dry_run: bool,
+    /// Report paths that vanished since the snapshot as skipped, not errors.
+    pub skip_missing: bool,
+    /// Accept an entry whose inode changed but whose file type still matches.
+    ///
+    /// The identity check exists to block a hard-link swap, but an ordinary
+    /// editor save is write-then-rename, which also produces a new inode. So
+    /// "I rewrote this file and now want my permissions back" and "someone
+    /// swapped this file under me" look identical from here. The default is
+    /// to refuse; this opts into the former reading.
+    pub allow_replaced: bool,
+}
+
 /// Describe why the live path no longer matches what the snapshot recorded.
 ///
 /// Restoring metadata onto an entry that was swapped out since the snapshot
 /// was taken would apply the recorded mode/owner to whatever now sits at that
 /// path — a symlink or hard link planted by whoever controls the parent
 /// directory. Both are privilege-escalation primitives when janitor runs as
-/// root, so any drift aborts that entry instead.
-fn entry_drift(entry: &SnapEntry, md: &fs::Metadata) -> Option<String> {
+/// root, so drift aborts that entry instead.
+fn entry_drift(entry: &SnapEntry, md: &fs::Metadata, allow_replaced: bool) -> Option<String> {
     let now_symlink = md.file_type().is_symlink();
-    if now_symlink != entry.is_symlink {
+    // The type check is never waived: it is what stops the recorded mode and
+    // owner from landing on a symlink's target.
+    if now_symlink != entry.is_symlink || (!now_symlink && md.is_dir() != entry.is_dir) {
         return Some(format!(
             "type changed since the snapshot ({} → {})",
             kind_word(entry.is_symlink, entry.is_dir),
             kind_word(now_symlink, md.is_dir())
         ));
     }
-    if !now_symlink && md.is_dir() != entry.is_dir {
-        return Some(format!(
-            "type changed since the snapshot ({} → {})",
-            kind_word(entry.is_symlink, entry.is_dir),
-            kind_word(now_symlink, md.is_dir())
-        ));
+    if allow_replaced {
+        return None;
     }
     // Backups written before identity capture store zeroes; there is nothing
     // to compare against, so the type check above is all we can enforce.
@@ -127,7 +141,11 @@ fn entry_drift(entry: &SnapEntry, md: &fs::Metadata) -> Option<String> {
         return None;
     }
     if md.dev() != entry.dev || md.ino() != entry.ino {
-        return Some("inode changed since the snapshot (path was replaced)".to_string());
+        return Some(
+            "inode changed since the snapshot (path was replaced; \
+             pass --allow-replaced if this was your own rewrite)"
+                .to_string(),
+        );
     }
     None
 }
@@ -148,16 +166,17 @@ fn kind_word(is_symlink: bool, is_dir: bool) -> &'static str {
 /// parent's stricter perms doesn't block access to children we still
 /// need to restore.
 ///
-/// Entries whose live inode no longer matches the snapshot are refused (see
-/// [`entry_drift`]). Missing paths count as errors unless `skip_missing`.
-pub fn apply_restore(entries: &[SnapEntry], dry_run: bool, skip_missing: bool) -> u32 {
+/// Entries whose live state no longer matches the snapshot are refused (see
+/// [`entry_drift`] and [`RestoreOptions`]).
+pub fn apply_restore(entries: &[SnapEntry], opts: RestoreOptions) -> u32 {
+    let dry_run = opts.dry_run;
     let mut errors = 0u32;
     for entry in entries.iter().rev() {
         let p = &entry.path;
         let md = match fs::symlink_metadata(p) {
             Ok(m) => m,
             Err(_) => {
-                if skip_missing {
+                if opts.skip_missing {
                     eprintln!("skip (missing): {}", p.display());
                 } else {
                     eprintln!(
@@ -169,7 +188,7 @@ pub fn apply_restore(entries: &[SnapEntry], dry_run: bool, skip_missing: bool) -
                 continue;
             }
         };
-        if let Some(reason) = entry_drift(entry, &md) {
+        if let Some(reason) = entry_drift(entry, &md, opts.allow_replaced) {
             eprintln!("error: refusing to restore {}: {reason}", p.display());
             errors += 1;
             continue;
@@ -367,7 +386,7 @@ mod tests {
         let f = s.0.join("f");
         fs::write(&f, b"x").unwrap();
         let e = entry_for(&f);
-        assert!(entry_drift(&e, &fs::symlink_metadata(&f).unwrap()).is_none());
+        assert!(entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), false).is_none());
     }
 
     /// §C-01: the recorded file was swapped for a symlink. Restoring would
@@ -382,7 +401,7 @@ mod tests {
         fs::remove_file(&f).unwrap();
         std::os::unix::fs::symlink(s.0.join("victim"), &f).unwrap();
 
-        let drift = entry_drift(&e, &fs::symlink_metadata(&f).unwrap());
+        let drift = entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), false);
         assert!(drift.unwrap().contains("type changed"));
     }
 
@@ -396,7 +415,7 @@ mod tests {
         let e = entry_for(&f);
         replace_with_fresh_inode(&s.0, &f);
 
-        let drift = entry_drift(&e, &fs::symlink_metadata(&f).unwrap());
+        let drift = entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), false);
         assert!(drift.unwrap().contains("inode changed"));
     }
 
@@ -422,7 +441,34 @@ mod tests {
         e.ino = 0;
         replace_with_fresh_inode(&s.0, &f);
 
-        assert!(entry_drift(&e, &fs::symlink_metadata(&f).unwrap()).is_none());
+        assert!(entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), false).is_none());
+    }
+
+    /// `--allow-replaced` waives the inode check for the editor-rewrite case.
+    #[test]
+    fn allow_replaced_accepts_a_new_inode() {
+        let s = Scratch::new("allow");
+        let f = s.0.join("f");
+        fs::write(&f, b"x").unwrap();
+        let e = entry_for(&f);
+        replace_with_fresh_inode(&s.0, &f);
+
+        assert!(entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), true).is_none());
+    }
+
+    /// It must NOT waive the type check — that is what stops §C-01.
+    #[test]
+    fn allow_replaced_still_refuses_a_symlink_swap() {
+        let s = Scratch::new("allow-swap");
+        let f = s.0.join("f");
+        fs::write(&f, b"x").unwrap();
+        let e = entry_for(&f);
+
+        fs::remove_file(&f).unwrap();
+        std::os::unix::fs::symlink(s.0.join("victim"), &f).unwrap();
+
+        let drift = entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), true);
+        assert!(drift.unwrap().contains("type changed"));
     }
 
     #[test]
@@ -435,7 +481,7 @@ mod tests {
         fs::remove_file(&f).unwrap();
         fs::create_dir(&f).unwrap();
 
-        let drift = entry_drift(&e, &fs::symlink_metadata(&f).unwrap());
+        let drift = entry_drift(&e, &fs::symlink_metadata(&f).unwrap(), false);
         assert!(drift.unwrap().contains("type changed"));
     }
 }

@@ -542,7 +542,32 @@ else
 fi
 VICTIM_MODE=$(stat -c '%a' "$ROOT/swap/victim")
 if [[ "$VICTIM_MODE" == "600" ]]; then pass "swap victim keeps its mode"; else fail "swap victim became $VICTIM_MODE"; fi
+# --allow-replaced must NOT waive the type check.
+if $JAN restore "$SWAP_BID" --yes --allow-replaced > /dev/null 2>&1; then
+    fail "--allow-replaced waived the symlink type check"
+else
+    pass "--allow-replaced still refuses a symlink swap"
+fi
 rm -rf "$ROOT/swap"
+
+# ── 28e2. --allow-replaced accepts an editor-style rewrite ─────────────
+mkdir -p "$ROOT/rewrite"
+echo old > "$ROOT/rewrite/f"
+chmod 0644 "$ROOT/rewrite/f"
+RW_BID=$($JAN backup "$ROOT/rewrite/f" 2>&1 | grep -oP '(?<=backup: )\S+')
+# write-then-rename, exactly what an editor does: same type, new inode
+echo new > "$ROOT/rewrite/f.new"
+mv "$ROOT/rewrite/f.new" "$ROOT/rewrite/f"
+chmod 0600 "$ROOT/rewrite/f"
+if $JAN restore "$RW_BID" --yes > /dev/null 2>&1; then
+    fail "restore accepted a replaced inode without --allow-replaced"
+else
+    pass "restore refuses a replaced inode by default"
+fi
+assert "restore --allow-replaced accepts the rewrite" $JAN restore "$RW_BID" --yes --allow-replaced
+RW_MODE=$(stat -c '%a' "$ROOT/rewrite/f")
+if [[ "$RW_MODE" == "644" ]]; then pass "--allow-replaced restored the mode"; else fail "--allow-replaced left mode $RW_MODE"; fi
+rm -rf "$ROOT/rewrite"
 
 # ── 28f. grant on / is rejected, not a panic (§M-08) ──────────────────
 $JAN --dry-run grant / -u "$USER" -r --no-acl > /dev/null 2>&1

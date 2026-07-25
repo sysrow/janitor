@@ -12,7 +12,7 @@ use crate::helpers::{
     default_group_name, parse_access, path_chain, resolve_path_nofollow, validate_group_name,
 };
 use crate::locking::with_lock;
-use crate::perms::{apply_group_bits, apply_restore};
+use crate::perms::{apply_group_bits, apply_restore, RestoreOptions};
 use crate::render::{self, glyphs, paint, summary_line, DiagLevel, Style};
 use crate::snapshot::snapshot_with_acl;
 use crate::types::{AccessBits, Operation};
@@ -445,18 +445,13 @@ pub fn cmd_backup(path: &str, recursive: bool, capture_acl: bool) -> Result<()> 
     })
 }
 
-pub fn cmd_restore(
-    backup_id: &str,
-    dry_run: bool,
-    assume_yes: bool,
-    skip_missing: bool,
-) -> Result<()> {
+pub fn cmd_restore(backup_id: &str, assume_yes: bool, opts: RestoreOptions) -> Result<()> {
     let data = load_backup(backup_id)?;
-    restore_with_preview(&data, dry_run, assume_yes, skip_missing, "restore")
+    restore_with_preview(&data, assume_yes, opts, "restore")
 }
 
 /// Undo the most recent backup (newest by file mtime).
-pub fn cmd_undo(dry_run: bool, assume_yes: bool, skip_missing: bool) -> Result<()> {
+pub fn cmd_undo(assume_yes: bool, opts: RestoreOptions) -> Result<()> {
     let files = crate::backup::list_backup_files()?;
     let latest = files
         .iter()
@@ -472,16 +467,16 @@ pub fn cmd_undo(dry_run: bool, assume_yes: bool, skip_missing: bool) -> Result<(
         .ok_or_else(|| PmError::Other("invalid backup filename".into()))?
         .to_string();
     let data = load_backup(&bid)?;
-    restore_with_preview(&data, dry_run, assume_yes, skip_missing, "undo")
+    restore_with_preview(&data, assume_yes, opts, "undo")
 }
 
 fn restore_with_preview(
     data: &crate::types::Backup,
-    dry_run: bool,
     assume_yes: bool,
-    skip_missing: bool,
+    opts: RestoreOptions,
     verb: &str,
 ) -> Result<()> {
+    let dry_run = opts.dry_run;
     let stdout_tty = is_terminal::is_terminal(std::io::stdout());
     let g = glyphs();
 
@@ -603,7 +598,7 @@ fn restore_with_preview(
         for e in &data.entries {
             crate::locks::ensure_not_locked(&e.path)?;
         }
-        let mut errors = apply_restore(&data.entries, dry_run, skip_missing);
+        let mut errors = apply_restore(&data.entries, opts);
         errors += revert_account_changes(&data.operation, dry_run);
         Ok(errors)
     })?;

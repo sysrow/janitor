@@ -203,7 +203,13 @@ pub fn cmd_batch(file: &str, dry_run: bool) -> Result<()> {
                 // how far down the file the run got.
                 if let Some(entries) = &rollback {
                     eprintln!("batch: rolling back {} path(s)", entries.len());
-                    let failed = crate::perms::apply_restore(entries, false, true);
+                    let failed = crate::perms::apply_restore(
+                        entries,
+                        crate::perms::RestoreOptions {
+                            skip_missing: true,
+                            ..Default::default()
+                        },
+                    );
                     if failed > 0 {
                         eprintln!(
                             "batch: rollback incomplete ({failed} error(s)); \

@@ -381,6 +381,7 @@ to omit POSIX ACLs from the snapshot. Output includes the backup id.
 .I BACKUP_ID
 .RB [ \-\-yes ]
 .RB [ \-\-skip\-missing ]
+.RB [ \-\-allow\-replaced ]
 .PP
 Revert a snapshot. Mode, owner, group, and (if captured) ACLs are restored
 atomically per path. Symlinks use
@@ -396,10 +397,17 @@ or hard link since the backup cannot redirect the change to another file.
 Paths that no longer exist count as errors unless
 .B \-\-skip\-missing
 is given.
+.PP
+An ordinary editor save is write-then-rename, which produces a new inode too,
+so restoring a file you have since edited reports it as replaced. Pass
+.B \-\-allow\-replaced
+when that is what happened; the file-type check still applies, so a path
+swapped for a symlink is refused either way.
 .SS undo
 .B janitor undo
 .RB [ \-\-yes ]
 .RB [ \-\-skip\-missing ]
+.RB [ \-\-allow\-replaced ]
 .PP
 Restore the most recent backup. Shortcut for looking up the newest snapshot
 and running
