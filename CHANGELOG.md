@@ -42,7 +42,8 @@ Ships one fix that 0.1.6's changelog claimed but did not contain.
 
 ### Security
 
-- **`seal` leaked pinhole traversal into unrelated branches.** The parent
+- **`seal` leaked pinhole traversal into unrelated branches.**
+  ([GHSA-xp8h-3m9f-w38h](https://github.com/sysrow/janitor/security/advisories/GHSA-xp8h-3m9f-w38h), CWE-732, medium.) The parent
   chains of every pinhole were merged into one set, and each principal was
   then granted `--x` across all of it — so a user allowed only under
   `/base/a` also received traversal on `/base/b`, which belongs to a
