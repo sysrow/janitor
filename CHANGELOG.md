@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-25
+
+Ships one fix that 0.1.6's changelog claimed but did not contain.
+
+### Security
+
+- **`seal` leaked pinhole traversal into unrelated branches.** The parent
+  chains of every pinhole were merged into one set, and each principal was
+  then granted `--x` across all of it — so a user allowed only under
+  `/base/a` also received traversal on `/base/b`, which belongs to a
+  different pinhole. Chains are now kept per pinhole and each principal
+  only reaches its own ancestors; `(principal, path)` pairs are deduped so
+  shared parents are written once.
+
+  0.1.6 listed this as fixed. It was not: only the surrounding changes to
+  `seal` (unconditional ACL capture in its snapshot, no-follow path
+  resolution) landed. Anyone who ran `janitor seal` with more than one
+  `--allow` on 0.1.6 or earlier should re-check the resulting ACLs —
+  `getfacl -R <base>` will show the extra `--x` entries — and re-run
+  `seal` on 0.1.7 to clear them.
+
+### Fixed
+
+- `restore` now warns when the backup contains entries whose ACLs were
+  never captured, instead of finishing silently and leaving the caller to
+  assume the ACLs came back too.
+
 ## [0.1.6] - 2026-07-25
 
 Security and correctness pass over the whole codebase. The theme is
@@ -28,11 +55,9 @@ holes that made some changes unrevertible.
   :grp link` changed the target's group instead of the link's —
   contradicting the `lchown(2)` semantics documented in the README.
   Mutating commands now keep the final component intact.
-- **`seal` leaked pinhole traversal into unrelated branches.** Parent
-  chains of all pinholes were merged into one set and every principal was
-  granted `--x` on all of it, so a user allowed only under `/base/a`
-  also got traversal on `/base/b`. Each pinhole now applies only to its
-  own ancestors.
+- **`seal` leaked pinhole traversal into unrelated branches.**
+  *This entry was wrong: the fix did not actually ship in 0.1.6.
+  See 0.1.7.*
 - **`restore` accepted arbitrary backup ids.** `load_backup` interpolated
   its argument straight into a path, so `restore ../../elsewhere` read
   and applied a payload from outside the backup directory. Ids are
