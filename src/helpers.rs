@@ -268,6 +268,22 @@ pub fn is_pseudo_fs(path: &Path) -> bool {
     PSEUDO_FS_MAGIC.contains(&fs_type)
 }
 
+/// Render bytes as `\xNN` escapes so an undecodable path can at least be
+/// named in an error message.
+fn hex_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(64)
+        .map(|b| {
+            if b.is_ascii_graphic() || *b == b'/' {
+                (*b as char).to_string()
+            } else {
+                format!("\\x{b:02x}")
+            }
+        })
+        .collect()
+}
+
 /// Read extra paths from stdin (NUL-separated if `stdin0`) and/or a file
 /// (newline-separated; `-` means stdin). Extends `base` with them.
 pub fn read_extra_paths(
@@ -285,7 +301,17 @@ pub fn read_extra_paths(
             if chunk.is_empty() {
                 continue;
             }
-            base.push(String::from_utf8_lossy(chunk).to_string());
+            // `from_utf8_lossy` would replace the undecodable bytes with
+            // U+FFFD and hand back a path that names a *different* file (or
+            // none). For a tool that then chmods whatever it was given,
+            // guessing is the wrong answer — refuse instead.
+            let s = std::str::from_utf8(chunk).map_err(|_| {
+                PmError::Other(format!(
+                    "--stdin0: path is not valid UTF-8 and cannot be handled safely: {}",
+                    hex_preview(chunk)
+                ))
+            })?;
+            base.push(s.to_string());
         }
     }
     if let Some(f) = from_file {
