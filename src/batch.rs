@@ -111,7 +111,7 @@ pub fn cmd_batch(file: &str, dry_run: bool) -> Result<()> {
     with_lock(|| {
         // Phase 2: ONE snapshot + ONE backup id covering every op.
         if !dry_run {
-            let snap = snapshot_with_acl(&union, false);
+            let snap = snapshot_with_acl(&union, true)?;
             let bid = save_backup(
                 snap,
                 Operation {

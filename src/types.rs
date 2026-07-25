@@ -30,6 +30,11 @@ pub struct SnapEntry {
     /// Raw default ACL text (directories only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_acl: Option<String>,
+    /// ACL capture was requested but could not be performed — the tooling is
+    /// missing or the filesystem has no ACL support. Distinct from `acl:
+    /// None`, which means "captured, and there was nothing to record".
+    #[serde(default)]
+    pub acl_unavailable: bool,
 }
 
 /// Serialize PathBuf as raw bytes (OsStr) so non-UTF-8 filenames survive.

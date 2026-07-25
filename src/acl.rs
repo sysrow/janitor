@@ -59,7 +59,11 @@ pub fn supports_acl(path: &Path) -> bool {
 }
 
 /// Get the access ACL of a path in canonical (compact) form.
-/// Returns None if ACL tooling not installed or only the base mode is present.
+///
+/// Returns `Ok(None)` when the ACL tooling is not installed or the path
+/// carries only its base mode. A `getfacl` that runs but *fails* is an
+/// error: silently turning it into "no ACL" would let a mutation proceed
+/// with a backup that cannot restore the original ACL.
 pub fn get_acl(path: &Path) -> Result<Option<String>> {
     if !acl_available() {
         return Ok(None);
@@ -71,7 +75,11 @@ pub fn get_acl(path: &Path) -> Result<Option<String>> {
         .output()
         .map_err(|e| PmError::Other(format!("getfacl failed: {e}")))?;
     if !out.status.success() {
-        return Ok(None);
+        return Err(PmError::Other(format!(
+            "getfacl {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let trimmed = text.trim();
@@ -93,7 +101,11 @@ pub fn get_default_acl(path: &Path) -> Result<Option<String>> {
         .output()
         .map_err(|e| PmError::Other(format!("getfacl -d failed: {e}")))?;
     if !out.status.success() {
-        return Ok(None);
+        return Err(PmError::Other(format!(
+            "getfacl -d {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     // Filter out lines that aren't actual ACL entries.

@@ -376,7 +376,7 @@ pub fn cmd_chmod(
 
     with_lock(|| {
         if !dry_run {
-            let snap = snapshot_with_acl(&paths, capture_acl);
+            let snap = snapshot_with_acl(&paths, capture_acl)?;
             let target_str = resolved_targets
                 .iter()
                 .map(|p| p.display().to_string())
@@ -446,7 +446,7 @@ pub fn cmd_chown(
 
     with_lock(|| {
         if !dry_run {
-            let snap = snapshot_with_acl(&paths, capture_acl);
+            let snap = snapshot_with_acl(&paths, capture_acl)?;
             let target_str = resolved_targets
                 .iter()
                 .map(|p| p.display().to_string())
@@ -629,7 +629,7 @@ pub fn cmd_copy_perms(
     }
 
     with_lock(|| {
-        let snap_entries = snapshot_with_acl(&targets, include_acl);
+        let snap_entries = snapshot_with_acl(&targets, include_acl)?;
         let mut backup_id: Option<String> = None;
         if !dry_run {
             let bid = save_backup(

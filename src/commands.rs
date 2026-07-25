@@ -176,7 +176,7 @@ pub fn cmd_grant(
         // Single backup covering parents + target + recursive descendants.
         let mut backup_id: Option<String> = None;
         if !dry_run {
-            let snap = snapshot_with_acl(&all_paths, capture_acl);
+            let snap = snapshot_with_acl(&all_paths, capture_acl)?;
             let op = Operation {
                 op_type: "grant".into(),
                 user: user.map(String::from),
@@ -404,7 +404,7 @@ pub fn cmd_backup(path: &str, recursive: bool, capture_acl: bool) -> Result<()> 
         paths.extend(collect_recursive(&target, &empty));
     }
     with_lock(|| {
-        let snap = snapshot_with_acl(&paths, capture_acl);
+        let snap = snapshot_with_acl(&paths, capture_acl)?;
         let count = snap.len();
         let bid = save_backup(
             snap,
@@ -576,7 +576,15 @@ fn restore_with_preview(
         }
     }
 
-    let errors = apply_restore(&data.entries, dry_run, skip_missing);
+    // Restore is a mutation like any other: it must respect `janitor lock`
+    // and hold the global lock so it cannot interleave with a concurrent
+    // grant/chmod that is halfway through its own backup.
+    let errors = with_lock(|| {
+        for e in &data.entries {
+            crate::locks::ensure_not_locked(&e.path)?;
+        }
+        Ok(apply_restore(&data.entries, dry_run, skip_missing))
+    })?;
     if errors > 0 {
         return Err(PmError::Other(format!("{errors} error(s) during restore")));
     }

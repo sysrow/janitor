@@ -126,7 +126,7 @@ pub fn cmd_policy_apply(file: &str, dry_run: bool) -> Result<()> {
     with_lock(|| {
         // Phase 2: ONE snapshot + ONE backup id for the entire policy run.
         if !dry_run {
-            let snap = snapshot_with_acl(&union, false);
+            let snap = snapshot_with_acl(&union, true)?;
             let bid = save_backup(
                 snap,
                 Operation {

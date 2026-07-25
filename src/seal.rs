@@ -238,7 +238,7 @@ pub fn cmd_seal(
         for p in &pinholes {
             snap_set.push(p.path.clone());
         }
-        let snap = snapshot_with_acl(&snap_set, !pinholes.is_empty());
+        let snap = snapshot_with_acl(&snap_set, true)?;
 
         let bid = save_backup(
             snap,

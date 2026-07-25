@@ -57,6 +57,11 @@ pub enum PmError {
     #[error("seal --base must be a directory: {0}")]
     SealBaseNotDir(PathBuf),
 
+    #[error(
+        "cannot snapshot {path}: {reason}\n       refusing to mutate with an incomplete backup"
+    )]
+    SnapshotFailed { path: PathBuf, reason: String },
+
     #[error("{0}")]
     Other(String),
 }

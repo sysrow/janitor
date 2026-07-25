@@ -307,6 +307,7 @@ mod tests {
             ino: md.ino(),
             acl: None,
             default_acl: None,
+            acl_unavailable: false,
         }
     }
 

@@ -381,25 +381,25 @@ pub fn cmd_audit_fix(
     let parts: Vec<&str> = action.splitn(2, ' ').collect();
     match parts.as_slice() {
         ["chmod", arg] => {
-            crate::chperm::cmd_chmod(arg.trim(), &paths, false, false, None, &empty, dry_run)
+            crate::chperm::cmd_chmod(arg.trim(), &paths, false, true, None, &empty, dry_run)
         }
         ["chown", arg] => {
-            crate::chperm::cmd_chown(arg.trim(), &paths, false, false, None, &empty, dry_run)
+            crate::chperm::cmd_chown(arg.trim(), &paths, false, true, None, &empty, dry_run)
         }
         ["preset", name] => {
             crate::presets::cmd_apply_preset(name.trim(), &paths, false, &empty, dry_run)
         }
         ["strip-world-write"] => {
-            crate::chperm::cmd_chmod("o-w", &paths, false, false, None, &empty, dry_run)
+            crate::chperm::cmd_chmod("o-w", &paths, false, true, None, &empty, dry_run)
         }
         ["strip-setuid"] => {
-            crate::chperm::cmd_chmod("u-s", &paths, false, false, None, &empty, dry_run)
+            crate::chperm::cmd_chmod("u-s", &paths, false, true, None, &empty, dry_run)
         }
         ["strip-setgid"] => {
-            crate::chperm::cmd_chmod("g-s", &paths, false, false, None, &empty, dry_run)
+            crate::chperm::cmd_chmod("g-s", &paths, false, true, None, &empty, dry_run)
         }
         ["strip-sticky"] => {
-            crate::chperm::cmd_chmod("-t", &paths, false, false, None, &empty, dry_run)
+            crate::chperm::cmd_chmod("-t", &paths, false, true, None, &empty, dry_run)
         }
         _ => Err(crate::errors::PmError::Other(format!(
             "unsupported --fix action: {action:?}  (try `chmod MODE`, `chown SPEC`, \
