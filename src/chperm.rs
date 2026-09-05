@@ -141,7 +141,9 @@ pub fn apply_chmod_to_paths(
             );
             changed += 1;
         } else {
-            match fs::set_permissions(p, fs::Permissions::from_mode(new_mode)) {
+            // Pin the inode that was just inspected: a path-based chmod
+            // would follow a symlink swapped in after the check above.
+            match crate::perms::chmod_nofollow(p, new_mode, Some((md.dev(), md.ino()))) {
                 Ok(()) => {
                     // Print the before→after diff line unconditionally
                     // so piped / logged output stays auditable. `paint`
@@ -662,27 +664,30 @@ pub fn cmd_copy_perms(
     }
 
     // Collect targets (dst + optionally children), honoring --exclude.
-    // Check locks on every expanded descendant, not just the root.
-    let mut targets: Vec<std::path::PathBuf> = Vec::new();
-    if !exclude.is_excluded(&dst_path) {
-        targets.push(dst_path.clone());
+    // Check locks on every expanded descendant, not just the root. An
+    // excluded DST prunes its whole subtree, exactly as `chmod -E` does.
+    if exclude.is_excluded(&dst_path) {
+        eprintln!("copy-perms: no paths left after --exclude");
+        return Ok(());
     }
-    if recursive {
+    let mut targets: Vec<std::path::PathBuf> = vec![dst_path.clone()];
+    // A symlink operand is changed itself (lchown) and never descended.
+    let dst_is_dir = fs::symlink_metadata(&dst_path)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if recursive && dst_is_dir {
         for entry in walkdir::WalkDir::new(&dst_path)
             .follow_links(false)
+            .follow_root_links(false)
             .min_depth(1)
             .into_iter()
             .filter_entry(|e| !exclude.is_excluded(e.path()))
-            .filter_map(|e| e.ok())
         {
+            let entry = entry.map_err(|e| walk_error(&dst_path, &e))?;
             let ep = entry.path().to_path_buf();
             crate::locks::ensure_not_locked(&ep)?;
             targets.push(ep);
         }
-    }
-    if targets.is_empty() {
-        eprintln!("copy-perms: no paths left after --exclude");
-        return Ok(());
     }
 
     with_lock(|| {
@@ -751,9 +756,11 @@ pub fn cmd_copy_perms(
         }
 
         // Apply ownership first, then mode (so chown's setuid/setgid
-        // clear is overwritten by the subsequent chmod).
+        // clear is overwritten by the subsequent chmod). Deepest paths
+        // first: a restrictive source mode applied to DST before its
+        // children would lock the walk out of its own subtree.
         let mut changed = 0usize;
-        for t in &targets {
+        for t in &depth_first(&targets) {
             let tmd = fs::symlink_metadata(t).map_err(|e| PmError::InsufficientPrivileges {
                 path: t.clone(),
                 reason: e.to_string(),
@@ -765,12 +772,12 @@ pub fn cmd_copy_perms(
                 }
             })?;
             if !tmd.file_type().is_symlink() {
-                fs::set_permissions(t, fs::Permissions::from_mode(src_mode)).map_err(|e| {
-                    PmError::InsufficientPrivileges {
+                crate::perms::chmod_nofollow(t, src_mode, Some((tmd.dev(), tmd.ino()))).map_err(
+                    |e| PmError::InsufficientPrivileges {
                         path: t.clone(),
                         reason: e.to_string(),
-                    }
-                })?;
+                    },
+                )?;
             }
             changed += 1;
         }
