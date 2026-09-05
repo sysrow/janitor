@@ -1,4 +1,4 @@
-//! Resolves the backup directory based on effective UID and `XDG_DATA_HOME`.
+//! Resolves the backup directory based on the effective UID and `$HOME`.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -30,10 +30,56 @@ pub fn backup_root() -> PathBuf {
 }
 
 pub fn ensure_backup_root() -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::MetadataExt;
     let root = backup_root();
-    fs::create_dir_all(&root)?;
+    // Refuse a symlink or a foreign directory in the final position.
+    // `create_dir_all` accepts an existing symlink to a directory, and the
+    // 0700 chmod below would then land on whatever it points at. With no
+    // $HOME the fallback lives under the world-writable temp dir, where any
+    // local user can plant such a link ahead of time.
+    match fs::symlink_metadata(&root) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "backup directory {} is a symlink; refusing to use it",
+                    root.display()
+                ),
+            ));
+        }
+        Ok(md) if !md.is_dir() => {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("backup directory {} is not a directory", root.display()),
+            ));
+        }
+        Ok(md) if md.uid() != geteuid().as_raw() => {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "backup directory {} is owned by uid {}, not by the current user (uid {})",
+                    root.display(),
+                    md.uid(),
+                    geteuid().as_raw()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => fs::create_dir_all(&root)?,
+        Err(e) => return Err(e),
+    }
     // Harden backup directory: 0700 (owner only) to prevent backup injection.
     let md = fs::symlink_metadata(&root)?;
+    if md.file_type().is_symlink() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "backup directory {} became a symlink; refusing to use it",
+                root.display()
+            ),
+        ));
+    }
     let mode = md.permissions().mode() & 0o777;
     if mode != 0o700 {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;

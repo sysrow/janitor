@@ -1,7 +1,7 @@
 //! Low-level mode/owner mutations (raw `chmod`/`lchown`), with no snapshotting.
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use nix::unistd::{Gid, Uid};
@@ -96,6 +96,71 @@ pub fn preview_restore(entries: &[SnapEntry]) -> Vec<String> {
         out.push(line);
     }
     out
+}
+
+/// `chmod(2)` that never follows a symlink and can re-verify the inode.
+///
+/// A path-based chmod follows symlinks, so between the `symlink_metadata`
+/// check every caller does and the chmod itself, whoever controls the
+/// parent directory can swap the file for a symlink to `/etc/shadow` and
+/// have root apply the mode there. Opening with `O_PATH|O_NOFOLLOW` pins
+/// the inode; `fstat` proves it is not a symlink (and, when the caller
+/// knows what it snapshotted, still the same inode); the mode is then
+/// applied through `/proc/self/fd`, which resolves to the pinned inode.
+/// Special bits pass through untouched, unlike `fs::set_permissions`.
+pub fn chmod_nofollow(path: &Path, mode: u32, expect: Option<(u64, u64)>) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let md = file.metadata()?;
+    if md.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "path is a symlink (refusing to chmod through it)",
+        ));
+    }
+    if let Some((dev, ino)) = expect {
+        if md.dev() != dev || md.ino() != ino {
+            return Err(std::io::Error::other(
+                "inode changed underneath (path was replaced since it was checked)",
+            ));
+        }
+    }
+    let via_proc = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let rc = unsafe { libc::chmod(via_proc.as_ptr(), mode as libc::mode_t) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ENOENT) {
+        // No /proc: fall back to fchmodat(AT_SYMLINK_NOFOLLOW), which glibc
+        // 2.32+ and musl implement with the same O_PATH dance.
+        let rc = unsafe {
+            libc::fchmodat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                mode as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+    Err(e)
 }
 
 /// How strict `apply_restore` is about the state it finds on disk.
@@ -220,6 +285,15 @@ pub fn apply_restore(entries: &[SnapEntry], opts: RestoreOptions) -> u32 {
         if dry_run {
             // Preview already shows diffs; don't emit raw command lines.
         } else {
+            // The identity check above already passed; hand the same
+            // expectation to the chmod so a swap in between is caught too.
+            // Legacy backups store zeroes, and `--allow-replaced` accepted a
+            // new inode on purpose, so neither pins one.
+            let expect = if opts.allow_replaced || (entry.dev == 0 && entry.ino == 0) {
+                None
+            } else {
+                Some((entry.dev, entry.ino))
+            };
             let set_perms = || -> std::io::Result<()> {
                 // Ownership first: chown clears setuid/setgid, so the
                 // subsequent chmod re-applies them correctly. lchown is used
@@ -227,20 +301,7 @@ pub fn apply_restore(entries: &[SnapEntry], opts: RestoreOptions) -> u32 {
                 // swapped between the check above and here still cannot
                 // redirect the ownership change to another inode.
                 lchown(p, Some(uid), Some(gid))?;
-                fs::set_permissions(p, fs::Permissions::from_mode(perm))?;
-                // Rust's set_permissions may drop bits above 0o777 on
-                // some versions; re-apply via raw libc::chmod.
-                if perm & 0o7000 != 0 {
-                    use std::ffi::CString;
-                    use std::os::unix::ffi::OsStrExt;
-                    let c_path = CString::new(p.as_os_str().as_bytes())
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-                    let rc = unsafe { libc::chmod(c_path.as_ptr(), perm as libc::mode_t) };
-                    if rc != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                Ok(())
+                chmod_nofollow(p, perm, expect)
             };
             if let Err(e) = set_perms() {
                 eprintln!("error restoring {}: {e}", p.display());
@@ -325,26 +386,15 @@ pub fn apply_group_bits(
     // chmod unconditionally, even when new_mode == current. `new_mode` was
     // computed from the mode read *before* the chgrp above, and chown clears
     // setuid/setgid on executables — so skipping the chmod when nothing
-    // "changed" is exactly the case that silently drops those bits.
-    fs::set_permissions(path, fs::Permissions::from_mode(new_mode)).map_err(|e| {
+    // "changed" is exactly the case that silently drops those bits. The
+    // inode read above is pinned so a swap after the check cannot redirect
+    // the chmod.
+    chmod_nofollow(path, new_mode, Some((md.dev(), md.ino()))).map_err(|e| {
         PmError::InsufficientPrivileges {
             path: path.to_path_buf(),
             reason: e.to_string(),
         }
     })?;
-    // set_permissions can drop bits above 0o777 on some std versions.
-    if new_mode & 0o7000 != 0 {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        let c_path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|e| PmError::Other(format!("invalid path: {e}")))?;
-        if unsafe { libc::chmod(c_path.as_ptr(), new_mode as libc::mode_t) } != 0 {
-            return Err(PmError::InsufficientPrivileges {
-                path: path.to_path_buf(),
-                reason: std::io::Error::last_os_error().to_string(),
-            });
-        }
-    }
 
     Ok(())
 }
@@ -388,6 +438,33 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn chmod_nofollow_refuses_symlinks_and_swapped_inodes() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new("nofollow");
+        let target = s.0.join("target");
+        fs::write(&target, b"x").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = s.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            chmod_nofollow(&link, 0o644, None).is_err(),
+            "must not chmod through a link"
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Wrong identity: refused. Right identity: applied, special bits included.
+        assert!(chmod_nofollow(&target, 0o644, Some((0, 0))).is_err());
+        let md = fs::symlink_metadata(&target).unwrap();
+        chmod_nofollow(&target, 0o2640, Some((md.dev(), md.ino()))).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o2640
+        );
     }
 
     #[test]

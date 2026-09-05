@@ -9,21 +9,23 @@ use crate::types::Operation;
 use std::path::Path;
 use std::process::Command;
 
+// Absolute paths, like every other shell-out in this crate: a `chattr`
+// planted earlier in $PATH must never run with janitor's privileges.
+const CHATTR: &str = "/usr/bin/chattr";
+const LSATTR: &str = "/usr/bin/lsattr";
+
 fn which(cmd: &str) -> Result<()> {
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {cmd} >/dev/null 2>&1"))
-        .status();
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        _ => Err(PmError::Other(format!(
+    if Path::new(cmd).exists() {
+        Ok(())
+    } else {
+        Err(PmError::Other(format!(
             "`{cmd}` not found; install `e2fsprogs` (provides chattr/lsattr)"
-        ))),
+        )))
     }
 }
 
 pub fn cmd_attr_show(path: &str) -> Result<()> {
-    which("lsattr")?;
+    which(LSATTR)?;
     let p = resolve_path(path)?;
     print!("{}", read_attrs(&p)?);
     Ok(())
@@ -31,7 +33,7 @@ pub fn cmd_attr_show(path: &str) -> Result<()> {
 
 /// Raw `lsattr -d` output for one path.
 fn read_attrs(p: &Path) -> Result<String> {
-    let out = Command::new("lsattr")
+    let out = Command::new(LSATTR)
         .arg("-d")
         .arg(p)
         .output()
@@ -52,7 +54,7 @@ fn read_attrs(p: &Path) -> Result<String> {
 /// of those — `--dry-run attr set-immutable` really ran chattr, and the
 /// change could not be reverted with `janitor undo` at all.
 fn chattr(path: &str, flag: &str, dry_run: bool) -> Result<()> {
-    which("chattr")?;
+    which(CHATTR)?;
     // Resolve once and hand the *same* PathBuf to the lock check, the
     // snapshot and the subprocess: passing the raw argument through would
     // let `~/f` pass validation and then reach chattr as a literal tilde,
