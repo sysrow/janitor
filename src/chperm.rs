@@ -305,7 +305,7 @@ pub fn apply_symbolic_with_umask(
     Ok(mode)
 }
 
-fn apply_one(mut mode: u32, spec: &str, is_dir: bool, umask: u32) -> Result<u32> {
+fn apply_one(mode: u32, spec: &str, is_dir: bool, umask: u32) -> Result<u32> {
     // Split into whos and op+perms.
     let op_pos = spec
         .find(|c: char| ['+', '-', '='].contains(&c))
@@ -314,87 +314,68 @@ fn apply_one(mut mode: u32, spec: &str, is_dir: bool, umask: u32) -> Result<u32>
     let op = rest.chars().next().unwrap();
     let perms = &rest[1..];
 
-    let mut who_mask: u32 = 0;
-    if whos.is_empty() {
-        // POSIX: with no `who`, the effect is as if `a` were given "except
-        // that bits in the file mode creation mask are not affected". So
-        // `umask 077; chmod +x f` sets only u+x, matching coreutils.
-        // An explicit `a` ignores the umask, which is the whole point of
-        // spelling it out.
-        who_mask |= 0o777 & !umask;
-    } else if whos.contains('a') {
-        who_mask |= 0o700 | 0o070 | 0o007;
+    // `affected` is the set of bits this clause may touch, mirroring GNU
+    // coreutils' modechange.c: each explicit who selects its rwx triad plus
+    // its special bit (setuid for `u`, setgid for `g`, sticky for `o`), and
+    // no who at all selects every bit. POSIX adds that with no who, bits in
+    // the file mode creation mask are not *set* (they are still cleared by
+    // `=`), which is why `umask 022; chmod =rwx f` yields 0755 and
+    // `chmod = f` yields 0000 rather than 0022.
+    let mut affected: u32 = 0;
+    if whos.is_empty() || whos.contains('a') {
+        affected = 0o7777;
     } else {
         for c in whos.chars() {
             match c {
-                'u' => who_mask |= 0o700,
-                'g' => who_mask |= 0o070,
-                'o' => who_mask |= 0o007,
+                'u' => affected |= 0o4700,
+                'g' => affected |= 0o2070,
+                'o' => affected |= 0o1007,
                 _ => return Err(PmError::Other(format!("bad who in {spec:?}: {c}"))),
             }
         }
     }
 
-    let mut perm_bits: u32 = 0;
-    let mut setid = 0u32;
-    let mut sticky = 0u32;
+    let mut value: u32 = 0;
+    let mut mentioned: u32 = 0;
     for c in perms.chars() {
         match c {
-            'r' => perm_bits |= 0o444,
-            'w' => perm_bits |= 0o222,
-            'x' => perm_bits |= 0o111,
+            'r' => value |= 0o444,
+            'w' => value |= 0o222,
+            'x' => value |= 0o111,
             'X' => {
                 // Execute only if is a dir OR any existing exec bit.
                 if is_dir || (mode & 0o111) != 0 {
-                    perm_bits |= 0o111;
+                    value |= 0o111;
                 }
             }
-            's' => setid = 0o6000, // applies to who-relevant bits below
-            't' => sticky = 0o1000,
+            's' => {
+                value |= 0o6000;
+                mentioned |= 0o6000;
+            }
+            't' => {
+                value |= 0o1000;
+                mentioned |= 0o1000;
+            }
             _ => return Err(PmError::Other(format!("bad perm in {spec:?}: {c}"))),
         }
     }
-
-    let add_bits = perm_bits & who_mask;
-    // Special: 's' with u→suid(4000), s with g→sgid(2000)
-    let mut special_add: u32 = 0;
-    if setid != 0 {
-        if whos.is_empty() || whos.contains('u') || whos.contains('a') {
-            special_add |= 0o4000;
-        }
-        if whos.contains('g') || whos.is_empty() || whos.contains('a') {
-            special_add |= 0o2000;
-        }
-    }
-    if sticky != 0 {
-        special_add |= 0o1000;
+    value &= affected;
+    if whos.is_empty() {
+        value &= !(umask & 0o777);
     }
 
-    match op {
-        '+' => {
-            mode |= add_bits | special_add;
-        }
-        '-' => {
-            mode &= !(add_bits | special_add);
-        }
-        '=' => {
-            // Clear who_mask first, then set.
-            mode = (mode & !who_mask) | add_bits;
-            // Also clear setuid/setgid/sticky for the relevant who.
-            if whos.is_empty() || whos.contains('u') || whos.contains('a') {
-                mode &= !0o4000;
-            }
-            if whos.contains('g') || whos.is_empty() || whos.contains('a') {
-                mode &= !0o2000;
-            }
-            if whos.is_empty() || whos.contains('o') || whos.contains('a') {
-                mode &= !0o1000;
-            }
-            mode |= special_add;
-        }
+    let new_mode = match op {
+        '+' => mode | value,
+        '-' => mode & !value,
+        '=' => value | (mode & !affected),
         _ => unreachable!(),
-    }
-    Ok(mode & 0o7777)
+    };
+    // GNU chmod preserves a directory's setuid and setgid bits unless the
+    // clause names them: `chmod =rwx dir` keeps setgid, `chmod g=rxs dir`
+    // sets it, `chmod g-s dir` clears it.
+    let omit_change = if is_dir { 0o6000 & !mentioned } else { 0 };
+    let new_mode = (new_mode & !omit_change) | (mode & omit_change);
+    Ok(new_mode & 0o7777)
 }
 
 /// `chmod` command: change mode (octal or symbolic) with auto-backup.
@@ -868,6 +849,58 @@ mod tests {
             apply_symbolic_with_umask(0o600, "a+x", false, 0o077).unwrap(),
             0o711
         );
+    }
+
+    /// Measured against GNU coreutils with umask 022: `=` with no who clears
+    /// every bit and sets the requested ones minus the umask, and a
+    /// directory keeps setuid/setgid unless the clause names `s`.
+    #[test]
+    fn sym_equals_without_who_matches_coreutils() {
+        let um = 0o022;
+        assert_eq!(
+            apply_symbolic_with_umask(0o666, "=rwx", false, um).unwrap(),
+            0o755
+        );
+        assert_eq!(
+            apply_symbolic_with_umask(0o666, "=", false, um).unwrap(),
+            0o000
+        );
+        assert_eq!(
+            apply_symbolic_with_umask(0o6755, "=r", false, um).unwrap(),
+            0o444
+        );
+        assert_eq!(
+            apply_symbolic_with_umask(0o3777, "=rwx", true, um).unwrap(),
+            0o2755
+        );
+        assert_eq!(
+            apply_symbolic_with_umask(0o2775, "=", true, um).unwrap(),
+            0o2000
+        );
+        assert_eq!(
+            apply_symbolic_with_umask(0o666, "=rwx,o-w", false, um).unwrap(),
+            0o755
+        );
+    }
+
+    #[test]
+    fn sym_directories_keep_setid_unless_named() {
+        assert_eq!(apply_symbolic(0o2775, "g=rx", true).unwrap(), 0o2755);
+        assert_eq!(apply_symbolic(0o0755, "g=rxs", true).unwrap(), 0o2755);
+        assert_eq!(apply_symbolic(0o3775, "o=rx", true).unwrap(), 0o2775);
+        assert_eq!(apply_symbolic(0o2775, "a=rwx", true).unwrap(), 0o2777);
+        assert_eq!(apply_symbolic(0o2775, "u=rwx", true).unwrap(), 0o2775);
+        assert_eq!(apply_symbolic(0o6775, "o=rx", true).unwrap(), 0o6775);
+        // Files get no such protection.
+        assert_eq!(apply_symbolic(0o2755, "g=rx", false).unwrap(), 0o0755);
+    }
+
+    #[test]
+    fn sym_special_bits_follow_their_who() {
+        // `u+t` and `o+s` name a bit outside the selected class: no-op.
+        assert_eq!(apply_symbolic(0o755, "u+t", true).unwrap(), 0o755);
+        assert_eq!(apply_symbolic(0o755, "o+s", false).unwrap(), 0o755);
+        assert_eq!(apply_symbolic(0o755, "+s", false).unwrap(), 0o6755);
     }
 
     #[test]
