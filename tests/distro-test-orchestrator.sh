@@ -102,9 +102,9 @@ provision() {
     local name=$1 ip="${HOSTS[$1]}" fam="${FAMILY[$1]:-debian}"
     echo "  [$name] provisioning ($fam) ..."
     if [[ "$fam" == "rhel" ]]; then
-        ssh_host "$ip" 'dnf install -y acl shadow-utils util-linux e2fsprogs jq bash coreutils 2>&1 | tail -1' || return 1
+        ssh_host "$ip" 'set -o pipefail; dnf install -y acl shadow-utils util-linux e2fsprogs jq bash coreutils 2>&1 | tail -1' || return 1
     else
-        ssh_host "$ip" 'apt-get update -qq && apt-get install -y -qq acl bsdextrautils util-linux passwd e2fsprogs jq bash coreutils 2>&1 | tail -1' || return 1
+        ssh_host "$ip" 'set -o pipefail; apt-get update -qq && apt-get install -y -qq acl bsdextrautils util-linux passwd e2fsprogs jq bash coreutils 2>&1 | tail -1' || return 1
     fi
     ssh_host "$ip" 'echo "verify:"; rc=0; for c in setfacl getfacl lsattr chattr groupadd gpasswd runuser script jq; do command -v $c >/dev/null && echo "  ok $c" || { echo "  MISSING $c"; rc=1; }; done; exit $rc' || return 1
     echo "  [$name] provisioned."

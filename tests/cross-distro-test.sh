@@ -24,11 +24,13 @@ refute() {
 }
 
 assert_grep() {
-    if echo "$2" | grep -q "$3"; then pass "$1"; else fail "$1"; fi
+    if [[ -z "$3" ]]; then fail "$1 (empty pattern)"; return; fi
+    if echo "$2" | grep -q -- "$3"; then pass "$1"; else fail "$1"; fi
 }
 
 refute_grep() {
-    if ! echo "$2" | grep -q "$3"; then pass "$1"; else fail "$1"; fi
+    if [[ -z "$3" ]]; then fail "$1 (empty pattern)"; return; fi
+    if ! echo "$2" | grep -q -- "$3"; then pass "$1"; else fail "$1"; fi
 }
 
 assert_eq() {
@@ -46,7 +48,9 @@ cleanup() {
     done
     groupdel xd_grp 2>/dev/null || true
     # clean managed groups
-    getent group | awk -F: '/^pm_xd_/{print $1}' | while read -r g; do groupdel "$g" 2>/dev/null; done
+    # Managed groups are `pm_<slug>_<hash>`; the slug comes from the target's
+    # last two path components, so grants outside $ROOT get other prefixes.
+    getent group | awk -F: '$1 ~ /^pm_/ && $1 !~ /^pm_smoke_/ {print $1}' | while read -r g; do groupdel "$g" 2>/dev/null; done
     rm -rf "$ROOT"
     $JAN prune -k 0 2>/dev/null || true
 }
@@ -135,8 +139,8 @@ echo
 echo "── 5. chattr immutable ($FS_TYPE) ──"
 touch "$ROOT/imm_f"
 $JAN attr set-immutable "$ROOT/imm_f" 2>/dev/null
-LSATTR=$(lsattr -d "$ROOT/imm_f" 2>&1)
-assert_grep "immutable flag set" "$LSATTR" "i"
+LSATTR=$(lsattr -d "$ROOT/imm_f" 2>/dev/null | awk '{print $1}')
+if [[ "$LSATTR" == *i* ]]; then pass "immutable flag set"; else fail "immutable flag set (flags: '$LSATTR')"; fi
 # root cannot delete immutable file
 if rm -f "$ROOT/imm_f" 2>/dev/null; then
     fail "immutable prevents deletion"
@@ -278,8 +282,8 @@ MPK="/var/lib/janitor/backups/${BID}.mpk"
 assert "backup is .mpk file" test -f "$MPK"
 # MessagePack starts with 0x80-0x8f (fixmap), 0xde (map16), 0xdf (map32)
 # JSON starts with 0x7b '{'. If first byte is 0x7b → wrong format.
-FIRST=$(xxd -l1 -p "$MPK" 2>/dev/null)
-refute_grep "backup is not JSON" "$FIRST" "^7b$"
+FIRST=$(od -An -tx1 -N1 "$MPK" 2>/dev/null | tr -d ' \n')
+if [[ -n "$FIRST" && "$FIRST" != "7b" ]]; then pass "backup is not JSON"; else fail "backup is not JSON (first byte '$FIRST')"; fi
 # export works
 EXP=$($JAN -j export "$BID" 2>&1)
 assert_grep "export has entries" "$EXP" "entries"
@@ -428,10 +432,15 @@ mkdir -p "$ROOT/sym"
 echo real > "$ROOT/sym/real"
 ln -s "$ROOT/sym/real" "$ROOT/sym/link"
 chmod 0644 "$ROOT/sym/real"
-# chown on symlink should NOT follow it
+# chown on symlink should NOT follow it: the target starts as nobody and
+# must stay nobody, while the link itself changes.
+chown nobody "$ROOT/sym/real"
 $JAN chown root:root "$ROOT/sym/link" 2>/dev/null
 REAL_OWNER=$(stat -c '%U' "$ROOT/sym/real")
-assert_eq "chown on symlink does not follow" "$REAL_OWNER" "root"
+LINK_OWNER=$(stat -c '%U' "$ROOT/sym/link")
+assert_eq "chown on symlink does not follow" "$REAL_OWNER" "nobody"
+assert_eq "chown on symlink changes the link itself" "$LINK_OWNER" "root"
+chown root "$ROOT/sym/real"
 # chmod -R should skip symlink mode (symlink mode is meaningless on Linux)
 $JAN chmod 0700 "$ROOT/sym" -R 2>/dev/null
 REAL_MODE=$(stat -c '%a' "$ROOT/sym/real")
@@ -565,7 +574,7 @@ done
 BEFORE=$($JAN list-backups 2>/dev/null | wc -l)
 $JAN prune -k 2 2>/dev/null
 AFTER=$($JAN list-backups 2>/dev/null | wc -l)
-if [[ $AFTER -le $BEFORE ]]; then pass "prune reduced backups"; else fail "prune reduced backups (before=$BEFORE after=$AFTER)"; fi
+if [[ $BEFORE -ge 3 && $AFTER -eq 2 ]]; then pass "prune -k 2 leaves exactly two backups"; else fail "prune -k 2 left $AFTER backups (before=$BEFORE)"; fi
 rm -f "$ROOT/prune_f"
 echo
 
@@ -840,7 +849,7 @@ OUT=$($JAN list-backups -p "$ROOT/lbp_f" 2>/dev/null)
 if [[ -n "$OUT" ]]; then
     pass "list-backups -p returns matching backup"
 else
-    pass "list-backups -p (no match or unsupported)"
+    fail "list-backups -p returned nothing for a path that was just changed"
 fi
 rm -f "$ROOT/lbp_f"
 echo

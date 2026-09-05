@@ -24,11 +24,13 @@ refute() {
 }
 
 assert_grep() {
-    if echo "$2" | grep -q "$3"; then pass "$1"; else fail "$1"; fi
+    if [[ -z "$3" ]]; then fail "$1 (empty pattern)"; return; fi
+    if echo "$2" | grep -q -- "$3"; then pass "$1"; else fail "$1"; fi
 }
 
 refute_grep() {
-    if ! echo "$2" | grep -q "$3"; then pass "$1"; else fail "$1"; fi
+    if [[ -z "$3" ]]; then fail "$1 (empty pattern)"; return; fi
+    if ! echo "$2" | grep -q -- "$3"; then pass "$1"; else fail "$1"; fi
 }
 
 # Capture output as if attached to a TTY. Many janitor commands suppress
@@ -68,7 +70,9 @@ cleanup() {
     rm -rf "$ROOT"
     userdel "$USER"  2>/dev/null || true
     userdel "$USER2" 2>/dev/null || true
-    getent group | awk -F: '/^pm_tmp_/ {print $1}' | xargs -r -n1 groupdel 2>/dev/null || true
+    # Managed groups are `pm_<slug>_<hash>`; the suite's own users also own
+    # `pm_smoke_*` groups, so exclude those by name rather than by prefix.
+    getent group | awk -F: -v u="$USER" -v u2="$USER2" '$1 ~ /^pm_/ && $1 != u && $1 != u2 {print $1}' | xargs -r -n1 groupdel 2>/dev/null || true
     groupdel testgrp  2>/dev/null || true
     groupdel devs     2>/dev/null || true
     rm -rf /var/lib/janitor/backups/*.mpk 2>/dev/null || true
@@ -158,9 +162,11 @@ if [[ -n "$BID2" ]]; then pass "grant short -u -a returns bid"; else fail "short
 # ── 6. managed group ────────────────────────────────────────────────
 # Managed group names are `pm_<slug>_<hash>`; slug derives from last two
 # non-trivial path components, so the exact prefix varies by target.
-if getent group | grep -q "^pm_"; then pass "managed group exists"; else fail "managed group missing"; fi
-GRP=$(getent group | awk -F: '/^pm_/ {print $1; exit}')
-if id -Gn "$USER" | grep -q "$GRP"; then pass "user in managed group"; else fail "user not in $GRP"; fi
+# `useradd` creates a `pm_smoke_user` group too, so a bare `^pm_` grep proves
+# nothing. Read the group off the granted target instead.
+PGRP=$(stat -c '%G' "$ROOT/deep/dir/target.txt")
+if [[ "$PGRP" == pm_* && "$PGRP" != "$USER" ]]; then pass "managed group exists ($PGRP)"; else fail "target group is $PGRP, not a managed pm_ group"; fi
+if id -nG "$USER" | tr ' ' '\n' | grep -qx "$PGRP"; then pass "user in managed group"; else fail "user not in $PGRP"; fi
 
 # ── 7. access semantics ─────────────────────────────────────────────
 assert "user CAN read target"     runuser -u "$USER" -- cat  "$ROOT/deep/dir/target.txt"
@@ -213,12 +219,17 @@ BKUP3=$($JAN b "$ROOT/deep/dir/target.txt" 2>&1)
 assert_grep "alias b == backup"       "$BKUP3" "backup:"
 
 # ── 11b. list-backups -p path filter ────────────────────────────────
+# One backup outside $ROOT guarantees the filter has something to drop.
+OTHER_F="/tmp/pm_other_$$"
+touch "$OTHER_F"
+$JAN backup "$OTHER_F" > /dev/null 2>&1
 LS_ALL=$($JAN ls 2>&1 | wc -l)
 LS_FILTERED=$($JAN ls -p "$ROOT" 2>&1 | wc -l)
-if [[ "$LS_ALL" -ge "$LS_FILTERED" ]]; then pass "ls -p filter narrows list"; else fail "ls -p did not narrow ($LS_ALL vs $LS_FILTERED)"; fi
+if [[ "$LS_FILTERED" -ge 1 && "$LS_ALL" -gt "$LS_FILTERED" ]]; then pass "ls -p filter narrows list"; else fail "ls -p did not narrow ($LS_ALL vs $LS_FILTERED)"; fi
+rm -f "$OTHER_F"
 LS_NONE=$($JAN ls -p "/nonexistent-path-$$" 2>&1 | wc -l)
-# header+separator = 2 lines when no rows match (table mode)
-if [[ "$LS_NONE" -le 2 ]]; then pass "ls -p with no matches is empty"; else fail "ls -p noise $LS_NONE"; fi
+# Piped list-backups prints bare ids only, so no match means no output at all.
+if [[ "$LS_NONE" -eq 0 ]]; then pass "ls -p with no matches is empty"; else fail "ls -p noise $LS_NONE"; fi
 LS_JSON=$($JAN --json ls -p "$ROOT" 2>&1 | jq 'length')
 if [[ "$LS_JSON" -ge 1 ]]; then pass "ls -p --json length ok"; else fail "json length $LS_JSON"; fi
 
@@ -533,6 +544,7 @@ chmod 0644 "$ROOT/swap/real"
 echo victim > "$ROOT/swap/victim"
 chmod 0600 "$ROOT/swap/victim"
 SWAP_BID=$($JAN backup "$ROOT/swap/real" 2>&1 | grep -oP '(?<=backup: )\S+')
+if [[ -z "$SWAP_BID" ]]; then fail "swap backup produced no id"; fi
 rm -f "$ROOT/swap/real"
 ln -s "$ROOT/swap/victim" "$ROOT/swap/real"
 if $JAN restore "$SWAP_BID" --yes > /dev/null 2>&1; then
@@ -555,6 +567,7 @@ mkdir -p "$ROOT/rewrite"
 echo old > "$ROOT/rewrite/f"
 chmod 0644 "$ROOT/rewrite/f"
 RW_BID=$($JAN backup "$ROOT/rewrite/f" 2>&1 | grep -oP '(?<=backup: )\S+')
+if [[ -z "$RW_BID" ]]; then fail "rewrite backup produced no id"; fi
 # write-then-rename, exactly what an editor does: same type, new inode
 echo new > "$ROOT/rewrite/f.new"
 mv "$ROOT/rewrite/f.new" "$ROOT/rewrite/f"
@@ -612,35 +625,36 @@ if command -v setfacl > /dev/null 2>&1 && getent passwd daemon > /dev/null 2>&1;
         refute_grep "seal: branch a has no foreign principal" "$A_ACL" "user:daemon:"
         assert_grep "seal: branch b carries its own principal" "$B_ACL" "user:daemon:"
         refute_grep "seal: branch b has no foreign principal" "$B_ACL" "user:$USER:"
+        $JAN undo --yes > /dev/null 2>&1
     else
         echo "  SKIP  seal pinhole isolation (seal failed on this filesystem)"
     fi
-    $JAN undo --yes > /dev/null 2>&1
     rm -rf "$SEAL_ISO"
 fi
 
-# ── 28e5. a getfacl that runs and fails aborts the mutation (§H-04) ───
-# Distinct from "getfacl is not installed", which is NOT an error: that
-# case is flagged in the snapshot and warned about once. This covers the
-# other branch — the tooling is there, the filesystem supports ACLs, and
-# the read fails anyway. Faking it means replacing the binary, so this
-# only runs inside the disposable test container.
+# ── 28e5. snapshots read ACLs without getfacl ────────────────────────
+# ACLs are read from the posix_acl extended attributes, so a missing or
+# broken getfacl binary neither aborts a mutation nor loses the ACL from
+# the backup. Hiding the binary only makes sense inside the disposable
+# test container.
 if [[ -f /.dockerenv || -f /run/.containerenv ]] && [[ "$(id -u)" -eq 0 ]] && [[ -x /usr/bin/getfacl ]]; then
     mkdir -p "$ROOT/aclfail"
     echo x > "$ROOT/aclfail/f"
     chmod 0644 "$ROOT/aclfail/f"
-    cp -a /usr/bin/getfacl /usr/bin/getfacl.janitor-backup
-    printf '#!/bin/sh\necho "simulated getfacl failure" >&2\nexit 1\n' > /usr/bin/getfacl
-    chmod 0755 /usr/bin/getfacl
-    if $JAN chmod 0600 "$ROOT/aclfail/f" > /dev/null 2>&1; then
-        ACLFAIL_RESULT=proceeded
+    if setfacl -m "u:$USER:rw" "$ROOT/aclfail/f" 2>/dev/null; then
+        mv /usr/bin/getfacl /usr/bin/getfacl.janitor-hidden
+        NOGETFACL_OUT=$($JAN chmod 0600 "$ROOT/aclfail/f" 2>&1)
+        NOGETFACL_RC=$?
+        NOGETFACL_BID=$(echo "$NOGETFACL_OUT" | awk '/^backup:/ {print $2}')
+        NOGETFACL_EXPORT=$($JAN -j export "$NOGETFACL_BID" 2>&1)
+        mv -f /usr/bin/getfacl.janitor-hidden /usr/bin/getfacl
+        if [[ $NOGETFACL_RC -eq 0 ]]; then pass "mutation succeeds without getfacl"; else fail "mutation failed without getfacl: $NOGETFACL_OUT"; fi
+        assert_grep "snapshot captured the ACL without getfacl" "$NOGETFACL_EXPORT" "user:$USER:rw-"
+        assert "restore rewrites the ACL from the xattr-read snapshot" $JAN restore "$NOGETFACL_BID" --yes
+        setfacl -b "$ROOT/aclfail/f"
     else
-        ACLFAIL_RESULT=aborted
+        echo "  SKIP  snapshot without getfacl (setfacl unsupported here)"
     fi
-    ACLFAIL_MODE=$(stat -c '%a' "$ROOT/aclfail/f")
-    mv -f /usr/bin/getfacl.janitor-backup /usr/bin/getfacl
-    if [[ "$ACLFAIL_RESULT" == "aborted" ]]; then pass "snapshot aborts when getfacl fails"; else fail "snapshot proceeded despite getfacl failing"; fi
-    if [[ "$ACLFAIL_MODE" == "644" ]]; then pass "file untouched when the snapshot aborted"; else fail "file changed to $ACLFAIL_MODE despite a failed snapshot"; fi
     rm -rf "$ROOT/aclfail"
 fi
 
@@ -654,15 +668,16 @@ mkdir -p "$ROOT/blind/inner"
 echo x > "$ROOT/blind/inner/ww.txt"
 chmod 0666 "$ROOT/blind/inner/ww.txt"
 chmod 000 "$ROOT/blind/inner"
-if [[ "$(id -u)" -ne 0 ]]; then
-    # root can read a 000 directory, so this only proves anything unprivileged.
-    if $JAN audit "$ROOT/blind" -W --paths > /dev/null 2>&1; then
-        fail "audit reported success over an unreadable subtree"
-    else
-        pass "audit fails on an unreadable subtree"
-    fi
-    assert "audit --best-effort still succeeds" $JAN audit "$ROOT/blind" -W --paths --best-effort
+# root can read a 000 directory, so run the scan as the unprivileged user.
+BLIND_ROOT_MODE=$(stat -c '%a' "$ROOT")
+chmod 755 "$ROOT" "$ROOT/blind"
+if runuser -u "$USER" -- $JAN audit "$ROOT/blind" -W --paths > /dev/null 2>&1; then
+    fail "audit reported success over an unreadable subtree"
+else
+    pass "audit fails on an unreadable subtree"
 fi
+assert "audit --best-effort still succeeds" runuser -u "$USER" -- $JAN audit "$ROOT/blind" -W --paths --best-effort
+chmod "$BLIND_ROOT_MODE" "$ROOT"
 chmod 755 "$ROOT/blind/inner"
 rm -rf "$ROOT/blind"
 
@@ -672,7 +687,9 @@ if command -v chattr > /dev/null 2>&1; then
     ATTR_BEFORE=$(lsattr -d "$ROOT/attr-dry" 2>/dev/null | awk '{print $1}')
     $JAN --dry-run attr set-immutable "$ROOT/attr-dry" > /dev/null 2>&1
     ATTR_AFTER=$(lsattr -d "$ROOT/attr-dry" 2>/dev/null | awk '{print $1}')
-    if [[ "$ATTR_BEFORE" == "$ATTR_AFTER" ]]; then pass "attr --dry-run does not run chattr"; else fail "attr --dry-run changed flags: $ATTR_BEFORE -> $ATTR_AFTER"; fi
+    if [[ -z "$ATTR_BEFORE" ]]; then
+        echo "  SKIP  attr --dry-run (lsattr unsupported on this filesystem)"
+    elif [[ "$ATTR_BEFORE" == "$ATTR_AFTER" ]]; then pass "attr --dry-run does not run chattr"; else fail "attr --dry-run changed flags: $ATTR_BEFORE -> $ATTR_AFTER"; fi
     chattr -i "$ROOT/attr-dry" 2>/dev/null || true
     rm -f "$ROOT/attr-dry"
 fi
@@ -759,8 +776,7 @@ JM2=$($JAN -j audit "$ROOT" -m 644 2>&1)
 if echo "$JM2" | jq -e '.[0].path' > /dev/null 2>&1; then pass "audit -j short"; else fail "-j audit invalid"; fi
 
 # ── 31. find-orphans ────────────────────────────────────────────────
-FO=$($JAN find-orphans "$ROOT" 2>&1)
-if echo "$FO" | grep -q "no orphan\|orphan"; then pass "find-orphans ran"; else pass "find-orphans empty ok"; fi
+assert "find-orphans runs" $JAN find-orphans "$ROOT"
 
 # create an orphan
 if ORPHAN_ID=$(pick_orphan_id "$ROOT/deep/sibling.txt"); then
@@ -921,9 +937,12 @@ if [[ "$TGT_G" == "devs" ]]; then pass "grant -g devs (group only)"; else fail "
 
 # ── 46. grant -L max-level ─────────────────────────────────────────
 chmod -R 700 "$ROOT"
-$JAN grant "$ROOT/deep/dir/target.txt" -u "$USER" -a r -L 1 > /dev/null 2>&1
-# -L 1 should limit how many parents get touched; verify we got a backup
-assert "grant -L 1 runs"              test -d /var/lib/janitor/backups
+L_OUT=$($JAN grant "$ROOT/deep/dir/target.txt" -u "$USER" -a r -L 1 2>&1)
+assert_grep "grant -L 1 runs"         "$L_OUT" "backup:"
+# -L 1 touches only the nearest parent: deep/dir gains group traverse, deep stays 700.
+L_DIR=$(stat -c '%a' "$ROOT/deep/dir")
+L_DEEP=$(stat -c '%a' "$ROOT/deep")
+if [[ "${L_DIR:1:1}" == "1" && "$L_DEEP" == "700" ]]; then pass "grant -L 1 limits the parent chain"; else fail "grant -L 1 touched the wrong parents (dir=$L_DIR deep=$L_DEEP)"; fi
 
 # ── 47. export --json structure ────────────────────────────────────
 B_EX=$($JAN b "$ROOT/deep/dir/target.txt" 2>&1 | awk '/^backup:/ {print $2}')
@@ -1350,6 +1369,296 @@ if $JAN lock "$ROOT/lk" >/dev/null 2>&1; then fail "double-lock should error"; e
 $JAN unlock "$ROOT/lk" > /dev/null
 if $JAN unlock "$ROOT/lk" >/dev/null 2>&1; then fail "unlock-unlocked should error"; else pass "unlock-unlocked rejected"; fi
 rm -f "$ROOT/lk"
+
+# ── 78. restore removes a default ACL added after the snapshot ────────
+chmod 755 "$ROOT"
+mkdir -p "$ROOT/dacl"
+DACL_BID=$($JAN backup "$ROOT/dacl" 2>&1 | awk '/^backup:/ {print $2}')
+if [[ -z "$DACL_BID" ]]; then fail "dacl backup produced no id"; fi
+$JAN acl grant "$ROOT/dacl" -u "$USER" -a rwx -d > /dev/null 2>&1
+if getfacl -cd "$ROOT/dacl" 2>/dev/null | grep -q "user:$USER"; then
+    $JAN restore "$DACL_BID" --yes > /dev/null 2>&1
+    DACL_AFTER=$(getfacl -cd "$ROOT/dacl" 2>/dev/null | grep -v '^#' | grep -c . || true)
+    if [[ "$DACL_AFTER" -eq 0 ]]; then pass "restore removes a default ACL added after the snapshot"; else fail "restore left a default ACL behind ($DACL_AFTER entries)"; fi
+else
+    echo "  SKIP  restore default ACL (acl grant -d unsupported here)"
+fi
+rm -rf "$ROOT/dacl"
+
+# ── 79. grant -R refuses when a descendant is locked ──────────────────
+mkdir -p "$ROOT/gl/sub"
+echo x > "$ROOT/gl/sub/f"
+chmod 600 "$ROOT/gl/sub/f"
+$JAN lock "$ROOT/gl/sub/f" -r "smoke" > /dev/null 2>&1
+refute "grant -R refuses a locked descendant" $JAN grant "$ROOT/gl" -u "$USER" -a r -R
+GL_MODE=$(stat -c '%a' "$ROOT/gl/sub/f")
+if [[ "$GL_MODE" == "600" ]]; then pass "locked descendant untouched by grant -R"; else fail "locked descendant became $GL_MODE"; fi
+$JAN unlock "$ROOT/gl/sub/f" > /dev/null 2>&1
+rm -rf "$ROOT/gl"
+
+# ── 80. seal refuses a locked pinhole path and keeps nested pinholes ──
+if command -v setfacl > /dev/null 2>&1; then
+    mkdir -p "$ROOT/sl/priv"
+    echo k > "$ROOT/sl/priv/key"
+    $JAN lock "$ROOT/sl/priv" -r "smoke" > /dev/null 2>&1
+    refute "seal refuses a locked pinhole path" $JAN seal "$ROOT/sl" -B root:root:700 --allow "$USER:r" "$ROOT/sl/priv/key"
+    SL_ACL=$(getfacl -c "$ROOT/sl/priv" 2>/dev/null)
+    refute_grep "locked pinhole parent got no ACL" "$SL_ACL" "user:$USER:"
+    $JAN unlock "$ROOT/sl/priv" > /dev/null 2>&1
+    rm -rf "$ROOT/sl"
+
+    mkdir -p "$ROOT/sn/dir"
+    echo x > "$ROOT/sn/dir/file"
+    if $JAN seal "$ROOT/sn" -B root:root:700 -R \
+        --allow "$USER:rwx" "$ROOT/sn/dir" \
+        --allow "$USER:r" "$ROOT/sn/dir/file" > /dev/null 2>&1; then
+        SN_ACL=$(getfacl -c "$ROOT/sn/dir" 2>/dev/null)
+        assert_grep "seal: explicit pinhole survives a nested pinhole's chain" "$SN_ACL" "user:$USER:rwx"
+        $JAN undo --yes > /dev/null 2>&1
+    else
+        echo "  SKIP  seal nested pinholes (seal failed on this filesystem)"
+    fi
+    if $JAN seal "$ROOT/sn" -B root:root:700 -R \
+        --allow "$USER:r" "$ROOT/sn/dir/file" \
+        --allow "$USER:rwx" "$ROOT/sn/dir" > /dev/null 2>&1; then
+        SN_ACL2=$(getfacl -c "$ROOT/sn/dir" 2>/dev/null)
+        assert_grep "seal: nested pinhole order does not matter" "$SN_ACL2" "user:$USER:rwx"
+        $JAN undo --yes > /dev/null 2>&1
+    else
+        echo "  SKIP  seal nested pinholes reversed (seal failed on this filesystem)"
+    fi
+    rm -rf "$ROOT/sn"
+fi
+
+# ── 81. recursive operands never follow a symlinked directory ─────────
+mkdir -p "$ROOT/lnk/tgt"
+echo x > "$ROOT/lnk/tgt/f"
+chmod 644 "$ROOT/lnk/tgt/f"
+chown root:root "$ROOT/lnk/tgt/f"
+ln -s "$ROOT/lnk/tgt" "$ROOT/lnk/dirlink"
+echo s > "$ROOT/lnk/src"
+chmod 600 "$ROOT/lnk/src"
+$JAN copy-perms "$ROOT/lnk/src" "$ROOT/lnk/dirlink" -R > /dev/null 2>&1
+LNK_F=$(stat -c '%a' "$ROOT/lnk/tgt/f")
+if [[ "$LNK_F" == "644" ]]; then pass "copy-perms -R does not descend through a symlinked operand"; else fail "copy-perms -R followed the symlink (f became $LNK_F)"; fi
+refute "grant refuses a symlink operand" $JAN grant "$ROOT/lnk/dirlink" -u "$USER" -a r -R
+LNK_G=$(stat -c '%G' "$ROOT/lnk/tgt/f")
+if [[ "$LNK_G" == "root" ]]; then pass "grant -R does not descend through a symlinked operand"; else fail "grant -R followed the symlink (group became $LNK_G)"; fi
+refute "seal -R refuses a symlinked base" $JAN seal "$ROOT/lnk/dirlink" -B root:root:700 -R
+LNK_F2=$(stat -c '%a' "$ROOT/lnk/tgt/f")
+if [[ "$LNK_F2" == "644" ]]; then pass "seal -R left the symlink target alone"; else fail "seal -R followed the symlink (f became $LNK_F2)"; fi
+rm -rf "$ROOT/lnk"
+
+# ── 82. symbolic '=' without who follows the umask like coreutils ─────
+echo x > "$ROOT/eqf"
+chmod 666 "$ROOT/eqf"
+(umask 022; $JAN chmod =rwx "$ROOT/eqf" > /dev/null 2>&1)
+EQ_MODE=$(stat -c '%a' "$ROOT/eqf")
+if [[ "$EQ_MODE" == "755" ]]; then pass "chmod =rwx honours the umask"; else fail "chmod =rwx gave $EQ_MODE (coreutils: 755)"; fi
+chmod 666 "$ROOT/eqf"
+(umask 022; $JAN chmod = "$ROOT/eqf" > /dev/null 2>&1)
+EQ_MODE2=$(stat -c '%a' "$ROOT/eqf")
+if [[ "$EQ_MODE2" == "0" ]]; then pass "chmod = clears every permission bit"; else fail "chmod = gave $EQ_MODE2 (coreutils: 0)"; fi
+mkdir -p "$ROOT/eqd"
+chmod 2775 "$ROOT/eqd"
+(umask 022; $JAN chmod =rwx "$ROOT/eqd" > /dev/null 2>&1)
+EQ_MODE3=$(stat -c '%a' "$ROOT/eqd")
+if [[ "$EQ_MODE3" == "2755" ]]; then pass "chmod =rwx keeps a directory's setgid bit"; else fail "chmod =rwx on a setgid dir gave $EQ_MODE3 (coreutils: 2755)"; fi
+rm -rf "$ROOT/eqf" "$ROOT/eqd"
+
+# ── 83. policy: failures exit non-zero, excludes prune, unknown keys rejected ─
+mkdir -p "$ROOT/pol"
+chmod 755 "$ROOT/pol"
+echo r > "$ROOT/pol/rootfile"
+chmod 644 "$ROOT/pol/rootfile"
+chown root:root "$ROOT/pol/rootfile"
+cat > "$ROOT/pol/fail.yaml" <<YAML
+rules:
+  - path: $ROOT/pol/rootfile
+    mode: "0600"
+YAML
+chmod 644 "$ROOT/pol/fail.yaml"
+if runuser -u "$USER" -- $JAN policy apply "$ROOT/pol/fail.yaml" > /dev/null 2>&1; then
+    fail "policy apply exited 0 although a rule could not be applied"
+else
+    pass "policy apply exits non-zero when a rule fails"
+fi
+POL_MODE=$(stat -c '%a' "$ROOT/pol/rootfile")
+if [[ "$POL_MODE" == "644" ]]; then pass "failed policy rule left the file alone"; else fail "rootfile became $POL_MODE"; fi
+
+mkdir -p "$ROOT/polv/.git"
+echo a > "$ROOT/polv/a"
+echo c > "$ROOT/polv/.git/config"
+cat > "$ROOT/pol/verify.yaml" <<YAML
+rules:
+  - path: $ROOT/polv
+    mode: "0755"
+    recursive: true
+    exclude: [".git"]
+YAML
+$JAN policy apply "$ROOT/pol/verify.yaml" > /dev/null 2>&1
+chmod 600 "$ROOT/polv/.git/config"
+assert "policy verify prunes an excluded subtree" $JAN policy verify "$ROOT/pol/verify.yaml"
+cat > "$ROOT/pol/bad.yaml" <<YAML
+rules:
+  - path: $ROOT/polv
+    mode: "0755"
+    recursve: true
+YAML
+refute "policy rejects unknown keys" $JAN policy verify "$ROOT/pol/bad.yaml"
+rm -rf "$ROOT/pol" "$ROOT/polv"
+
+# ── 84. path locks survive tabs and newlines ──────────────────────────
+LOCKS_BASE=$($JAN --json locks 2>/dev/null | jq 'length')
+TABDIR="$ROOT/lk"$'\t'"tab"
+mkdir -p "$TABDIR"
+chmod 755 "$TABDIR"
+assert "lock a path containing a tab" $JAN lock "$TABDIR" -r "smoke"
+refute "lock on a tab path blocks chmod" $JAN chmod 700 "$TABDIR"
+TAB_MODE=$(stat -c '%a' "$TABDIR")
+if [[ "$TAB_MODE" == "755" ]]; then pass "tab-path lock protected the directory"; else fail "tab-path lock bypassed (mode $TAB_MODE)"; fi
+mkdir -p "$ROOT/lk2"
+$JAN lock "$ROOT/lk2" -r "line one"$'\n'"line two" > /dev/null 2>&1
+LOCKS_N=$($JAN --json locks 2>/dev/null | jq 'length')
+if [[ "$LOCKS_N" == "$((LOCKS_BASE + 2))" ]]; then pass "newline in a lock reason does not split the record"; else fail "lock list has $LOCKS_N entries (expected $((LOCKS_BASE + 2)))"; fi
+refute "lock with newline reason still blocks" $JAN chmod 700 "$ROOT/lk2"
+assert "unlock tab path" $JAN unlock "$TABDIR"
+assert "unlock newline-reason path" $JAN unlock "$ROOT/lk2"
+LOCKS_N2=$($JAN --json locks 2>/dev/null | jq 'length')
+if [[ "$LOCKS_N2" == "$LOCKS_BASE" ]]; then pass "lock list back to baseline after unlock"; else fail "lock list has $LOCKS_N2 entries after unlock (expected $LOCKS_BASE)"; fi
+rm -rf "$TABDIR" "$ROOT/lk2"
+
+# ── 85. undo ignores files that are not janitor backups ───────────────
+echo u > "$ROOT/undo_f"
+chmod 644 "$ROOT/undo_f"
+$JAN chmod 600 "$ROOT/undo_f" > /dev/null 2>&1
+NEWEST=$(ls -t /var/lib/janitor/backups/*.mpk 2>/dev/null | head -1)
+cp "$NEWEST" /var/lib/janitor/backups/mybackup.mpk
+touch /var/lib/janitor/backups/mybackup.mpk
+assert "undo skips a stray .mpk file" $JAN undo --yes
+UNDO_MODE=$(stat -c '%a' "$ROOT/undo_f")
+if [[ "$UNDO_MODE" == "644" ]]; then pass "undo restored the newest real backup"; else fail "undo left $UNDO_MODE"; fi
+rm -f /var/lib/janitor/backups/mybackup.mpk "$ROOT/undo_f"
+
+# ── 86. revoke is transactional ───────────────────────────────────────
+mkdir -p "$ROOT/rv"
+echo x > "$ROOT/rv/f"
+chmod 600 "$ROOT/rv/f"
+$JAN grant "$ROOT/rv/f" -u "$USER" -a r > /dev/null 2>&1
+RV_GRP=$(stat -c '%G' "$ROOT/rv/f")
+RV_OUT=$($JAN revoke "$ROOT/rv/f" -u "$USER" 2>&1)
+assert_grep "revoke writes a backup" "$RV_OUT" "backup:"
+if id -nG "$USER" | tr ' ' '\n' | grep -qx "$RV_GRP"; then fail "revoke left $USER in $RV_GRP"; else pass "revoke removed $USER from $RV_GRP"; fi
+$JAN undo --yes > /dev/null 2>&1
+if id -nG "$USER" | tr ' ' '\n' | grep -qx "$RV_GRP"; then pass "undo re-adds the revoked membership"; else fail "undo did not re-add $USER to $RV_GRP"; fi
+$JAN lock "$ROOT/rv/f" -r smoke > /dev/null 2>&1
+refute "revoke refuses a locked path" $JAN revoke "$ROOT/rv/f" -u "$USER"
+$JAN unlock "$ROOT/rv/f" > /dev/null 2>&1
+rm -rf "$ROOT/rv"
+
+# ── 87. copy-perms -E matching DST prunes the whole subtree ──────────
+mkdir -p "$ROOT/cpx/sub"
+echo x > "$ROOT/cpx/sub/f"
+chmod 600 "$ROOT/cpx/sub/f"
+echo s > "$ROOT/cpsrc"
+chmod 644 "$ROOT/cpsrc"
+$JAN copy-perms "$ROOT/cpsrc" "$ROOT/cpx" -R -E "$ROOT/cpx" > /dev/null 2>&1
+CPX_MODE=$(stat -c '%a' "$ROOT/cpx/sub/f")
+if [[ "$CPX_MODE" == "600" ]]; then pass "copy-perms -E on DST prunes its children"; else fail "copy-perms rewrote an excluded subtree (f became $CPX_MODE)"; fi
+rm -rf "$ROOT/cpx" "$ROOT/cpsrc"
+
+# ── 88. query commands: unknown user, unreachable root, symlink target ─
+refute "tree -U rejects an unknown user" $JAN tree "$ROOT" -U no_such_user_zz -c never
+mkdir -p "$ROOT/wcx/inner"
+echo f > "$ROOT/wcx/inner/f"
+chmod 644 "$ROOT/wcx/inner/f"
+chmod 700 "$ROOT/wcx"
+TREE_U=$($JAN tree "$ROOT/wcx/inner" -U "$USER" -c never 2>&1)
+assert_grep "tree -U reports an unreachable root" "$TREE_U" "cannot traverse"
+WC_JSON=$($JAN --json who-can "$ROOT/wcx/inner/f" 2>&1)
+if echo "$WC_JSON" | jq -e --arg u "$USER" '.blocked | index($u)' > /dev/null 2>&1; then pass "who-can --json lists users blocked by the parent chain"; else fail "who-can --json has no blocked entry for $USER"; fi
+echo secret > "$ROOT/secret_f"
+chmod 600 "$ROOT/secret_f"
+ln -s "$ROOT/secret_f" "$ROOT/lnk_secret"
+INFO_U=$(tty_run "$JAN info $ROOT/lnk_secret -U $USER")
+assert_grep "info -U evaluates the symlink target" "$INFO_U" "symlink target"
+rm -rf "$ROOT/wcx" "$ROOT/secret_f" "$ROOT/lnk_secret"
+
+# ── 89. compare -R fails on an unreadable subtree ─────────────────────
+mkdir -p "$ROOT/cmpa/x" "$ROOT/cmpb/x"
+chmod 755 "$ROOT/cmpa" "$ROOT/cmpb"
+chmod 000 "$ROOT/cmpa/x" "$ROOT/cmpb/x"
+if runuser -u "$USER" -- $JAN compare "$ROOT/cmpa" "$ROOT/cmpb" -R > /dev/null 2>&1; then
+    fail "compare -R reported identical trees it could not read"
+else
+    pass "compare -R fails on an unreadable subtree"
+fi
+chmod 755 "$ROOT/cmpa/x" "$ROOT/cmpb/x"
+rm -rf "$ROOT/cmpa" "$ROOT/cmpb"
+
+# ── 90. audit --print0 emits raw bytes for non-UTF-8 names ────────────
+mkdir -p "$ROOT/nonutf"
+NONUTF="$ROOT/nonutf/caf"$'\xe9'
+echo x > "$NONUTF"
+chmod 666 "$NONUTF"
+if LC_ALL=C $JAN audit "$ROOT/nonutf" -W -0 2>/dev/null | LC_ALL=C grep -a -q "caf"$'\xe9'; then pass "audit --print0 keeps non-UTF-8 bytes"; else fail "audit --print0 mangled a non-UTF-8 name"; fi
+rm -rf "$ROOT/nonutf"
+
+# ── 91. help text matches the parser ─────────────────────────────────
+assert_grep "tree -H help describes a path" "$($JAN tree --help 2>&1)" "ancestor"
+assert_grep "epilog names preset apply" "$($JAN --help 2>&1)" "preset apply"
+assert_grep "undo help picks the newest backup" "$($JAN undo --help 2>&1)" "NR==1"
+refute_grep "explain help does not claim setuid checks" "$($JAN explain --help 2>&1)" "setuid"
+assert_grep "grant help names the real managed-group scheme" "$($JAN grant --help 2>&1)" "pm_<slug>_<hash>"
+
+# ── 92. recursive mutation refuses a tree it cannot fully walk ────────
+mkdir -p "$ROOT/wk/blind"
+echo a > "$ROOT/wk/a"
+chmod 644 "$ROOT/wk/a"
+chown -R "$USER:$USER" "$ROOT/wk"
+chmod 000 "$ROOT/wk/blind"
+if runuser -u "$USER" -- $JAN chmod 700 "$ROOT/wk" -R > /dev/null 2>&1; then
+    fail "chmod -R succeeded over an unreadable subtree"
+else
+    pass "chmod -R refuses an unreadable subtree"
+fi
+WK_A=$(stat -c '%a' "$ROOT/wk/a")
+if [[ "$WK_A" == "644" ]]; then pass "nothing changed when the walk failed"; else fail "chmod -R partially applied (a=$WK_A)"; fi
+chmod 755 "$ROOT/wk/blind"
+rm -rf "$ROOT/wk"
+
+# ── 93. backup directory must not be a symlink ────────────────────────
+FAKEHOME="$ROOT/fakehome"
+mkdir -p "$FAKEHOME/.local/share/janitor" "$FAKEHOME/elsewhere"
+ln -s "$FAKEHOME/elsewhere" "$FAKEHOME/.local/share/janitor/backups"
+chown -R "$USER:$USER" "$FAKEHOME"
+echo b > "$ROOT/bk_f"
+chmod 644 "$ROOT/bk_f"
+refute "backup refuses a symlinked backup directory" runuser -u "$USER" -- env HOME="$FAKEHOME" $JAN backup "$ROOT/bk_f"
+rm -rf "$FAKEHOME" "$ROOT/bk_f"
+
+# ── 94. evaluators read the ACL themselves, getfacl or not ────────────
+if [[ -f /.dockerenv || -f /run/.containerenv ]] && [[ "$(id -u)" -eq 0 ]] && [[ -x /usr/bin/getfacl ]]; then
+    echo x > "$ROOT/noget_f"
+    chmod 640 "$ROOT/noget_f"
+    chown root:root "$ROOT/noget_f"
+    if setfacl -m "u:$USER:r" "$ROOT/noget_f" 2>/dev/null; then
+        mv /usr/bin/getfacl /usr/bin/getfacl.janitor-hidden
+        NOGET_EXPLAIN=$($JAN explain "$ROOT/noget_f" -U "$USER" 2>&1)
+        NOGET_RC=$?
+        NOGET_WC=$($JAN --json who-can "$ROOT/noget_f" 2>&1)
+        NOGET_INFO=$($JAN info "$ROOT/noget_f" 2>&1)
+        mv /usr/bin/getfacl.janitor-hidden /usr/bin/getfacl
+        if [[ $NOGET_RC -eq 0 ]]; then pass "explain runs without getfacl"; else fail "explain failed without getfacl: $NOGET_EXPLAIN"; fi
+        assert_grep "explain sees the ACL entry without getfacl" "$NOGET_EXPLAIN" "acl user:$USER"
+        if echo "$NOGET_WC" | jq -e --arg u "$USER" '.read | index($u)' > /dev/null 2>&1; then pass "who-can sees the ACL grant without getfacl"; else fail "who-can missed the ACL grant for $USER"; fi
+        assert_grep "info lists the ACL entry without getfacl" "$NOGET_INFO" "user:$USER"
+        setfacl -b "$ROOT/noget_f"
+    else
+        echo "  SKIP  evaluators without getfacl (setfacl unsupported here)"
+    fi
+    rm -f "$ROOT/noget_f"
+fi
 
 $JAN prune -k 0 > /dev/null 2>&1
 
