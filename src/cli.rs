@@ -45,8 +45,8 @@ so `-rx`, `-xr`, `-rwx`, or `-r -w` all work. Use -a/--access \"rw\" as an \
 alternative string form. If no access flag is given, defaults to read-only.\n\n\
 The full parent chain of PATH is made traversable (`--x`) so the user can \
 reach the target, but siblings and other contents of parent directories \
-remain hidden. A managed group named `pm_tmp_<owner>_<pathhash>` is created \
-(unless -g GROUP is given) and the user is added to it. A snapshot is taken \
+remain hidden. A managed group named `pm_<slug>_<hash>` is created (the slug \
+comes from the last two path components; unless -g GROUP is given) and the user is added to it. A snapshot is taken \
 first; revert anytime with `janitor restore <id>`."
     )]
     Grant {
@@ -121,7 +121,7 @@ For partial (bit-level) revocation, use one of:\n  \
         /// Also walk and show each parent above PATH.
         #[arg(short = 'P', long)]
         show_parents: bool,
-        /// Highlight entries matching this substring.
+        /// Highlight this path and its ancestor chain.
         #[arg(short = 'H', long)]
         highlight: Option<String>,
         /// Highlight effective access for this user.
@@ -170,7 +170,7 @@ For partial (bit-level) revocation, use one of:\n  \
         visible_alias = "u",
         long_about = "Undo the most recent mutation.\n\n\
 Looks up the newest backup and restores it. Equivalent to:\n\n  \
-    janitor restore \"$(janitor ls | awk 'NR==3 {print $1}')\"\n\n\
+    janitor restore \"$(janitor ls | awk 'NR==1 {print $1}')\"\n\n\
 Useful as a one-shot revert after any grant / chmod / chown / acl operation.\n\
 Combine with --dry-run to preview what would be reverted."
     )]
@@ -348,7 +348,8 @@ Revert with `janitor restore <id>`."
         long_about = "Print everything you typically want to know about PATH in one view: \
 file type, owner and group, octal mode (incl. setuid / setgid / sticky), symbolic mode, \
 size, mtime, link target (for symlinks), and POSIX ACL entries if any are set. With -U USER \
-also prints whether USER can read, write, and execute/traverse PATH."
+also prints whether USER can read, write, and execute PATH itself; for a symlink the \
+target is evaluated. The parent chain is not checked here, use `explain` for that."
     )]
     Info {
         /// Target path.
@@ -532,9 +533,8 @@ One snapshot is taken for the entire operation; revert with `restore <id>`.",
     #[command(
         visible_alias = "e",
         long_about = "Human-readable explanation of effective access to PATH, walking the \
-full parent chain and checking traditional mode bits, POSIX ACLs, group memberships, \
-and setuid/setgid/sticky bits. Great for debugging 'why can't alice read this?' \
-questions."
+full parent chain and checking traditional mode bits, POSIX ACLs (including the mask) \
+and group memberships. Great for debugging 'why can't alice read this?' questions."
     )]
     Explain {
         /// Target path.
@@ -802,8 +802,8 @@ sudo janitor audit /srv -W -s -A        # world-writable, SUID, has-ACL\n\n  \
 sudo janitor acl grant /srv/shared -u bob -rwx -d -R\n\n  \
 # Reverse query: who can read /etc/shadow?\n  \
 janitor who-can /etc/shadow\n\n  \
-# Presets (private, group-shared, setgid-dir, ...). List with `janitor presets`.\n  \
-sudo janitor preset group-shared /srv/team -R\n\nSHORT FLAGS\n  \
+# Presets (private, group-shared, setgid-dir, ...). List with `janitor preset list`.\n  \
+sudo janitor preset apply group-shared /srv/team -R\n\nSHORT FLAGS\n  \
 -n dry-run   -j json\n  \
 -u user      -g group  -a access-string    -r read  -w write  -x exec\n  \
 -R recursive           -L max-level        -d default (acl)\n  \

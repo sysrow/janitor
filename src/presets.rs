@@ -179,8 +179,8 @@ pub fn cmd_apply_preset(
         None => {
             let suggestion = closest_preset(name);
             let tail = match suggestion {
-                Some(s) => format!("  (did you mean `{s}`?  or run `janitor presets`)"),
-                None => "  (try `janitor presets` for the full list)".into(),
+                Some(s) => format!("  (did you mean `{s}`?  or run `janitor preset list`)"),
+                None => "  (try `janitor preset list` for the full list)".into(),
             };
             return Err(PmError::Other(format!("unknown preset: {name:?}{tail}")));
         }
