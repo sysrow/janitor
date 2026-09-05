@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use nix::unistd::{Gid, Uid};
 use serde::Serialize;
 
-use crate::access::effective_for_user_path;
+use crate::access::{evaluate, InodeFacts, UserCtx};
 use crate::acl::has_extended_acl;
 use crate::errors::Result;
 use crate::helpers::{path_chain, resolve_path};
@@ -26,7 +26,13 @@ pub struct WhoCanReport {
     pub read: Vec<String>,
     pub write: Vec<String>,
     pub exec: Vec<String>,
+    /// The ancestor that stops the most listed users from reaching the
+    /// path, derived from the per-user traverse check (not from a bare
+    /// `o+x` heuristic, which flagged the owner of a 0750 home directory).
     pub blocked_by: Option<String>,
+    /// Users who appear in a list above but cannot traverse the parent
+    /// chain. The human output marks them; JSON consumers need the list.
+    pub blocked: Vec<String>,
 }
 
 #[derive(Default)]
@@ -46,23 +52,24 @@ pub fn cmd_who_can(path: &str, as_json: bool) -> Result<()> {
     let uid = md.uid();
     let gid = md.gid();
 
-    // Blocked-by: first non-root ancestor without `o+x`.
+    // Inode facts once per path: the target and every ancestor. Evaluating
+    // a user is then pure, so a host with thousands of NSS accounts costs
+    // one group lookup per user instead of two ACL reads per user per hop.
+    let facts = InodeFacts::read(&target)?;
     let chain = path_chain(&target, Path::new("/"));
-    let blocked_by = chain
+    let ancestors: Vec<(PathBuf, InodeFacts)> = chain
         .iter()
         .take(chain.len().saturating_sub(1))
-        .find(|p| {
-            fs::symlink_metadata(p)
-                .map(|m| (m.mode() & 0o001) == 0)
-                .unwrap_or(false)
-        })
-        .map(|p| p.display().to_string());
+        .map(|p| InodeFacts::read(p).map(|f| (p.clone(), f)))
+        .collect::<Result<_>>()?;
 
     let users = read_passwd_users();
 
     let mut read_bkt = Buckets::default();
     let mut write_bkt = Buckets::default();
     let mut exec_bkt = Buckets::default();
+    let mut blocked: BTreeSet<String> = BTreeSet::new();
+    let mut blocker_votes: BTreeMap<PathBuf, usize> = BTreeMap::new();
 
     for u in &users {
         if u.name == "root" || u.uid == 0 {
@@ -76,24 +83,42 @@ pub fn cmd_who_can(path: &str, as_json: bool) -> Result<()> {
             exec_bkt.root = is_dir || (mode & 0o111) != 0;
             continue;
         }
-        let d = match effective_for_user_path(&target, &u.name) {
-            Ok(d) => d,
+        let ctx = match UserCtx::resolve(&u.name) {
+            Ok(c) => c,
             Err(_) => continue,
         };
-        let cant_traverse = !user_can_traverse(&u.name, &target);
+        let d = evaluate(&facts, &ctx);
+        let blocker = ancestors
+            .iter()
+            .find(|(_, f)| !evaluate(f, &ctx).exec)
+            .map(|(p, _)| p.clone());
+        let cant_traverse = blocker.is_some();
+        let mut listed = false;
         for (bkt, has) in [
             (&mut read_bkt, d.read),
             (&mut write_bkt, d.write),
             (&mut exec_bkt, d.exec),
         ] {
             if has {
+                listed = true;
                 classify_into(bkt, &u.name, &d.reason);
                 if cant_traverse {
                     bkt.cant_traverse.insert(u.name.clone());
                 }
             }
         }
+        if listed {
+            if let Some(b) = blocker {
+                blocked.insert(u.name.clone());
+                *blocker_votes.entry(b).or_insert(0) += 1;
+            }
+        }
     }
+
+    let blocked_by = blocker_votes
+        .iter()
+        .max_by_key(|(_, n)| **n)
+        .map(|(p, _)| p.display().to_string());
 
     let report = WhoCanReport {
         path: target.display().to_string(),
@@ -101,6 +126,7 @@ pub fn cmd_who_can(path: &str, as_json: bool) -> Result<()> {
         write: sorted_flat(&write_bkt),
         exec: sorted_flat(&exec_bkt),
         blocked_by: blocked_by.clone(),
+        blocked: blocked.iter().cloned().collect(),
     };
 
     if as_json {
@@ -176,7 +202,10 @@ pub fn cmd_who_can(path: &str, as_json: bool) -> Result<()> {
             paint(Style::WarnMajor, glyphs().warn),
             paint(
                 Style::WarnMajor,
-                &format!("{b} blocks traversal for users outside its group.")
+                &format!(
+                    "{b} blocks traversal for {} of the users listed below.",
+                    blocked.len()
+                )
             )
         );
         println!(
@@ -297,20 +326,6 @@ fn print_bucket(label: &str, users: &[String], b: &Buckets) {
     }
 }
 
-fn user_can_traverse(user: &str, target: &Path) -> bool {
-    let chain = path_chain(target, Path::new("/"));
-    for p in chain.iter().take(chain.len().saturating_sub(1)) {
-        let d = match effective_for_user_path(p, user) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        if !d.exec {
-            return false;
-        }
-    }
-    true
-}
-
 struct UserRow {
     name: String,
     uid: u32,
@@ -362,10 +377,4 @@ fn read_passwd_users() -> Vec<UserRow> {
     seen.into_iter()
         .map(|(name, uid)| UserRow { name, uid })
         .collect()
-}
-
-// Legacy helpers retained for path_chain consumers that still need them.
-#[allow(dead_code)]
-fn _unused() {
-    let _ = PathBuf::new();
 }

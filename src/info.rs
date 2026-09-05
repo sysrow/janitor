@@ -293,7 +293,7 @@ pub fn cmd_info(path: &str, for_user: Option<&str>) -> Result<()> {
             " ".repeat(3),
             paint(
                 Style::Label,
-                "(on this inode; use `who-can` for chain evaluation)"
+                "(on this inode; use `explain` for the parent chain)"
             )
         );
     }

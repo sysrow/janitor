@@ -12,13 +12,13 @@ use std::path::{Path, PathBuf};
 
 use nix::unistd::{Gid, Uid};
 
-use crate::access::effective_for_user_path;
+use crate::access::{evaluate, AccessDecision, InodeFacts, UserCtx};
 use crate::acl::has_extended_acl;
 use crate::cli::ColorMode;
 use crate::errors::Result;
 use crate::helpers::{path_chain, resolve_path};
 use crate::render::{self, badge, glyphs, paint, summary_line, Style};
-use crate::users::{gid_to_name, uid_to_name};
+use crate::users::{gid_exists, gid_to_name, uid_exists, uid_to_name};
 
 // ── Flags / counters ───────────────────────────────────────────────────
 
@@ -33,6 +33,8 @@ struct Counts {
     world_write: usize,
     acl: usize,
     orphan: usize,
+    /// Entries whose access for `-U USER` could not be evaluated.
+    lens_errors: usize,
 }
 
 // ── Public entry point ─────────────────────────────────────────────────
@@ -50,6 +52,33 @@ pub fn cmd_tree(
     // Re-initialize shared color state for this command: --color wins over
     // the global auto-detection that main() already performed.
     render::init_color(color_mode);
+
+    // Resolve the lens user up front. A typo used to render a complete,
+    // plausible tree painted "no access" everywhere and exit 0.
+    let user_ctx = match for_user {
+        Some(u) => Some(UserCtx::resolve(u)?),
+        None => None,
+    };
+    // The chain above the root decides whether anything below it is
+    // reachable at all; `explain` and `who-can` already evaluate it.
+    let mut root_reachable = true;
+    if let Some(ctx) = &user_ctx {
+        let chain = path_chain(&root, Path::new("/"));
+        for p in chain.iter().take(chain.len().saturating_sub(1)) {
+            let facts = InodeFacts::read(p)?;
+            if !evaluate(&facts, ctx).exec {
+                println!(
+                    "{} {} cannot traverse {}; nothing below {} is reachable",
+                    paint(Style::WarnMajor, glyphs().warn),
+                    paint(Style::User, &ctx.name),
+                    paint(Style::Primary, &p.display().to_string()),
+                    paint(Style::Primary, &root.display().to_string())
+                );
+                root_reachable = false;
+                break;
+            }
+        }
+    }
 
     // Highlight chain (top-down path from / to highlighted node).
     let highlight_set: HashSet<PathBuf> = match highlight {
@@ -86,8 +115,8 @@ pub fn cmd_tree(
         0,
         max_depth,
         &highlight_set,
-        for_user,
-        true,
+        user_ctx.as_ref(),
+        root_reachable,
         &mut counts,
         show_acl,
     );
@@ -153,6 +182,14 @@ pub fn cmd_tree(
         ),
     ];
     println!("{}", summary_line(&segs));
+    if counts.lens_errors > 0 {
+        eprintln!(
+            "warning: {} entr{} could not be evaluated for {} (unreadable ACL); shown as no access",
+            counts.lens_errors,
+            if counts.lens_errors == 1 { "y" } else { "ies" },
+            for_user.unwrap_or("?")
+        );
+    }
 
     // Legend (only in TTY with colors on).
     if let Some(u) = for_user {
@@ -187,7 +224,7 @@ fn walk_tree(
     depth: usize,
     max_depth: Option<usize>,
     highlight_set: &HashSet<PathBuf>,
-    for_user: Option<&str>,
+    for_user: Option<&UserCtx>,
     parent_reachable: bool,
     counts: &mut Counts,
     show_acl: bool,
@@ -286,7 +323,7 @@ fn print_line(
     prefix_cols: usize,
     is_root: bool,
     highlight_set: &HashSet<PathBuf>,
-    for_user: Option<&str>,
+    for_user: Option<&UserCtx>,
     parent_reachable: bool,
     counts: &mut Counts,
     show_acl: bool,
@@ -333,30 +370,40 @@ fn print_line(
         counts.acl += 1;
     }
 
-    // Owner / group (+ orphan detection).
-    let (uname, u_orphan) = match nix::unistd::User::from_uid(Uid::from_raw(md.uid())) {
-        Ok(Some(u)) => (u.name, false),
-        _ => (format!("#{}", md.uid()), true),
+    // Owner / group (+ orphan detection), through the memoised NSS caches:
+    // a raw getpwuid per entry re-opened /etc/passwd for every file.
+    let (uid, gid) = (Uid::from_raw(md.uid()), Gid::from_raw(md.gid()));
+    let u_orphan = !uid_exists(uid);
+    let g_orphan = !gid_exists(gid);
+    let uname = if u_orphan {
+        format!("#{}", md.uid())
+    } else {
+        uid_to_name(uid)
     };
-    let (gname, g_orphan) = match nix::unistd::Group::from_gid(Gid::from_raw(md.gid())) {
-        Ok(Some(g)) => (g.name, false),
-        _ => (format!("#{}", md.gid()), true),
+    let gname = if g_orphan {
+        format!("#{}", md.gid())
+    } else {
+        gid_to_name(gid)
     };
     if u_orphan || g_orphan {
         counts.orphan += 1;
     }
-    let _ = (uid_to_name, gid_to_name);
 
     // Access-lens coloring for -U.
     let mut self_reachable = parent_reachable;
-    let lens = for_user.map(|user| {
-        let d =
-            effective_for_user_path(path, user).unwrap_or_else(|_| crate::access::AccessDecision {
-                read: false,
-                write: false,
-                exec: false,
-                reason: "error".into(),
-            });
+    let lens = for_user.map(|ctx| {
+        let d = match InodeFacts::read(path) {
+            Ok(facts) => evaluate(&facts, ctx),
+            Err(_) => {
+                counts.lens_errors += 1;
+                AccessDecision {
+                    read: false,
+                    write: false,
+                    exec: false,
+                    reason: "error".into(),
+                }
+            }
+        };
         if !parent_reachable {
             self_reachable = false;
             Style::Deny

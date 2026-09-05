@@ -100,22 +100,61 @@ fn print_acl_delta(x: &Snap, y: &Snap) {
     }
 }
 
+/// Snapshot one side. Fail-closed: a subtree that could not be read is
+/// reported and aborts the comparison. Silently dropping it let two trees
+/// with the same unreadable directory compare "identical", exit 0, in the
+/// CI drift check this command is advertised for.
 fn collect(root: &Path, recursive: bool) -> Result<BTreeMap<PathBuf, Snap>> {
     let mut out = BTreeMap::new();
-    if recursive && root.is_dir() {
+    let mut unreadable: Vec<String> = Vec::new();
+    let is_dir = fs::symlink_metadata(root)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if recursive && is_dir {
         for entry in walkdir::WalkDir::new(root)
             .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
+            .follow_root_links(false)
         {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    unreadable.push(match e.path() {
+                        Some(p) => format!("{}: {e}", p.display()),
+                        None => e.to_string(),
+                    });
+                    continue;
+                }
+            };
             let p = entry.path();
             let rel = p.strip_prefix(root).unwrap_or(p).to_path_buf();
-            if let Some(s) = snap(p) {
-                out.insert(rel, s);
+            match snap(p) {
+                Some(s) => {
+                    out.insert(rel, s);
+                }
+                None => unreadable.push(format!("{}: cannot stat", p.display())),
             }
         }
-    } else if let Some(s) = snap(root) {
-        out.insert(PathBuf::from(""), s);
+    } else {
+        match snap(root) {
+            Some(s) => {
+                out.insert(PathBuf::from(""), s);
+            }
+            None => unreadable.push(format!("{}: cannot stat", root.display())),
+        }
+    }
+    if !unreadable.is_empty() {
+        for u in unreadable.iter().take(10) {
+            eprintln!("  {} {u}", paint(Style::Danger, "unreadable"));
+        }
+        if unreadable.len() > 10 {
+            eprintln!("  … and {} more", unreadable.len() - 10);
+        }
+        return Err(crate::errors::PmError::Other(format!(
+            "compare: {} path(s) under {} could not be read; refusing to call trees \
+             identical that were not fully compared",
+            unreadable.len(),
+            root.display()
+        )));
     }
     Ok(out)
 }

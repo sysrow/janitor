@@ -214,14 +214,7 @@ pub fn cmd_explain(path: &str, for_user: Option<&str>) -> Result<()> {
 
         let rhs = if is_target {
             // Target: read/write/exec verdict phrasing.
-            let d = effective_for_user_path(p, &username).unwrap_or_else(|_| {
-                crate::access::AccessDecision {
-                    read: false,
-                    write: false,
-                    exec: false,
-                    reason: "error".into(),
-                }
-            });
+            let d = effective_for_user_path(p, &username)?;
             let bits = format!("r={} w={} x={}", ynb(d.read), ynb(d.write), ynb(d.exec));
             let verdict_style = if blocker_idx.is_some() {
                 Style::Deny
@@ -237,14 +230,7 @@ pub fn cmd_explain(path: &str, for_user: Option<&str>) -> Result<()> {
             )
         } else {
             // Ancestor: traverse verdict.
-            let d = effective_for_user_path(p, &username).unwrap_or_else(|_| {
-                crate::access::AccessDecision {
-                    read: false,
-                    write: false,
-                    exec: false,
-                    reason: "error".into(),
-                }
-            });
+            let d = effective_for_user_path(p, &username)?;
             if d.exec {
                 format!(
                     "{}   {}",
@@ -309,14 +295,7 @@ pub fn cmd_explain(path: &str, for_user: Option<&str>) -> Result<()> {
 
     // ── Verdict ───────────────────────────────────────────────────────
     println!();
-    let target_d = effective_for_user_path(&target, &username).unwrap_or_else(|_| {
-        crate::access::AccessDecision {
-            read: false,
-            write: false,
-            exec: false,
-            reason: "error".into(),
-        }
-    });
+    let target_d = effective_for_user_path(&target, &username)?;
     let traversable = blocker_idx.is_none();
     let (r, w, x) = if traversable {
         (target_d.read, target_d.write, target_d.exec)
