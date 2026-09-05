@@ -1,5 +1,5 @@
 '\" t
-.TH JANITOR 1 "2026-04-21" "janitor 0.1.0" "User Commands"
+.TH JANITOR 1 "2026-09-05" "janitor 0.1.7" "User Commands"
 .SH NAME
 janitor \- hierarchical Unix permissions manager with snapshots and ACL support
 .SH SYNOPSIS
@@ -114,7 +114,7 @@ Grant
 access to
 .IR PATH .
 A managed group is auto-created (named
-.BI pm_tmp_ <owner>_<pathhash> )
+.BI pm_ <slug>_<hash> )
 unless
 .B \-g
 is given. Parents are opened with
@@ -188,7 +188,12 @@ This is an
 .B all-or-nothing
 revoke: the user loses every bit of access that was granted via that group. The
 file's mode, ACLs, and the managed group itself are untouched; other members of
-the group keep their access.
+the group keep their access. Like every mutation it runs under the global lock,
+respects
+.BR "janitor lock" ,
+and writes a backup that records the removal, so
+.B janitor undo
+adds the membership back.
 .PP
 For
 .B bit-level
@@ -269,7 +274,26 @@ not
 Spell out
 .B a
 .RB ( a+x )
-to ignore the umask.
+to ignore the umask. With
+.B =
+and no
+.IR who ,
+every permission bit is cleared and the requested bits minus the umask are
+set, exactly as GNU
+.BR chmod (1)
+does: under
+.BR "umask 022" ,
+.B =rwx
+on a
+.I 0666
+file yields
+.I 0755
+and a bare
+.B =
+yields
+.IR 0000 .
+Directories keep their setuid and setgid bits unless the clause names
+.BR s .
 .PP
 A recursive chmod applies the deepest paths first, so tightening a tree does
 not remove the traverse bit from a directory whose children still have to be

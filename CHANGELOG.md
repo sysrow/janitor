@@ -7,7 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Modes are applied through a pinned file descriptor (`O_PATH|O_NOFOLLOW`,
+  inode identity re-checked against what was inspected or snapshotted)
+  instead of a path-based `chmod(2)`. A file swapped for a symlink between
+  the check and the write can no longer redirect the mode to the symlink's
+  target. Covers `restore`, `grant`, `chmod`, `copy-perms`, `seal`, `preset`,
+  `policy`, `batch` and `audit --fix`.
+- `grant -R` checks `janitor lock` on every descendant and `seal` on every
+  pinhole path and traverse chain. Both walked straight over locked
+  children before; only the operand itself was checked.
+- `grant`, `seal -R` and `copy-perms -R` no longer descend through a
+  symlinked operand into the tree it points at (walkdir follows a root
+  symlink by default). `grant` and `seal` refuse a symlink operand outright:
+  a symlink's own mode is never consulted, so there is nothing to grant.
+- Path locks are stored with escaped fields. A tab or newline in a path or
+  reason no longer splits or widens the record, and a non-UTF-8 path locks
+  the file that was named rather than a lossy look-alike that never matched
+  again (the lock silently protected nothing).
+- The backup directory is refused when it is a symlink or owned by another
+  user; the `$HOME`-less fallback lives in the world-writable temp dir where
+  such a link can be planted ahead of time.
+- `attr` runs `/usr/bin/chattr` and `/usr/bin/lsattr` by absolute path
+  instead of resolving them through `sh -c command -v`.
+- Dependencies: `crossbeam-epoch` 0.9.18 to 0.9.20 (RUSTSEC-2026-0204) and
+  `anyhow` 1.0.102 to 1.0.104 (RUSTSEC-2026-0190).
+
+### Fixed
+
+- `restore` and `undo` remove a default ACL a directory gained after the
+  snapshot. `setfacl --set` on the access ACL leaves the default ACL in
+  place, so `undo` after `acl grant -d` reported success and changed
+  nothing.
+- `revoke` is transactional: it runs under the global lock, respects path
+  locks and writes a backup that records the removal, so `undo` adds the
+  membership back. It used to call `gpasswd -d` directly with no way back.
+- Symbolic `chmod` with no `who` matches coreutils for `=`: under
+  `umask 022`, `chmod =rwx f` gives 0755 (was 0777) and `chmod = f` gives
+  0000 (was 0022). Directories keep setuid/setgid unless the clause names
+  `s`, and `u+t` / `o+s` are no-ops, as in GNU chmod.
+- `seal` merges the ACL demands of nested pinholes per (principal, path).
+  A pinhole on a directory plus another below it used to overwrite each
+  other's entry, leaving either no traverse or no explicit permissions.
+- `seal -R`, `copy-perms -R`, `chmod -R`, `chown -R`, `grant -R`, `preset -R`
+  and `policy apply` refuse a tree they could not fully enumerate instead
+  of mutating the readable part and exiting 0.
+- `copy-perms -R` and `seal -R` apply deepest paths first, so a restrictive
+  mode on the root no longer locks a non-root run out of its own subtree.
+- `copy-perms -E` matching DST prunes the whole subtree, as `chmod -E` does.
+- `policy apply` exits non-zero when a rule could not be applied to every
+  path (the backup id printed above is what `undo` needs). `policy verify`
+  prunes excluded directories like `apply`, resolves the rule path without
+  following a symlink, and reports unreadable paths. Unknown keys in the
+  policy file are rejected instead of silently narrowing a rule.
+- `compare -R` fails on an unreadable subtree instead of calling the trees
+  identical.
+- `undo` skips files in the backup directory that are not janitor backups.
+- `who-can --json` gains `blocked` (listed users who cannot traverse the
+  parent chain) and derives `blocked_by` from the per-user check instead of
+  a bare `o+x` heuristic that flagged the owner of a 0750 home directory.
+- `tree -U` validates the user (a typo painted the whole tree "no access"
+  and exited 0), evaluates the chain above the root, and evaluates symlinks
+  by their target. `info -U` does the same: a symlink's own 0777 used to
+  read as `rwx` whatever it pointed at.
+- `explain`, `info -U`, `who-can` and `tree -U` fail closed on an ACL they
+  cannot read instead of answering from mode bits; `audit -A` counts an
+  unreadable ACL as an unreadable path rather than "no ACL".
+- `audit --paths` and `--print0` emit the exact bytes of a non-UTF-8 name;
+  `--fix` refuses such a name up front instead of failing mid-run.
+- `grant` records `group_created` and `user_added` from probes made under
+  the lock, so two concurrent grants cannot both claim the group.
+- Help text: `tree -H` takes a path, the epilog says `preset list` and
+  `preset apply`, the `undo` equivalent is `awk 'NR==1'`, `explain` no
+  longer claims to check setuid bits, and the managed-group scheme is
+  `pm_<slug>_<hash>` everywhere (it never was `pm_tmp_<owner>_<hash>`).
+
 ### Changed
+
+- ACLs are read from the `system.posix_acl_access` and
+  `system.posix_acl_default` extended attributes and rendered in
+  `getfacl -c` form. Reading no longer spawns `getfacl` (once per path,
+  twice per directory, before) and no longer needs the `acl` package;
+  writing still goes through `setfacl`. A file without the attribute has
+  exactly the ACL its mode implies, so the common case is one syscall.
+- `restore` compares each entry's ACL with the live one and spawns
+  `setfacl` only for entries that differ.
+- `ensure_not_locked` re-parses `locks.txt` only when the file changed:
+  one `stat` per path instead of an open and parse per path.
+- `history` keeps only backup headers in memory instead of every entry of
+  every matching backup.
+- `who-can` reads each path's ACL once and resolves each user once, instead
+  of two `getfacl` spawns per user per path-chain hop.
+- `tree` resolves owners through the memoised NSS caches.
+
+### Changed (earlier)
 
 - Removed the crate-wide `#![allow(dead_code)]`. It is what let two
   `SnapEntry` fields be written into every backup and read by nothing;
@@ -30,6 +124,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- Smoke suite: assertions that could not fail were rewritten (managed
+  group, `find-orphans`, `grant -L 1`, `list-backups -p`, the `pm_tmp_`
+  cleanup prefix, `attr --dry-run` on an unsupported filesystem, and the
+  unreadable-subtree audit check that never ran as root), and sections 78
+  to 94 cover every fix above. Cross-distro suite: the chown-on-symlink,
+  immutable-flag, prune and `list-backups -p` checks now can fail, the
+  MessagePack check uses `od` instead of `xxd`, and cleanup removes every
+  managed group. `assert_grep` rejects an empty pattern in both suites.
+  The orchestrator's remote installs report failure (`pipefail`).
+- CI and release use `--locked`; the release gate checks that the tag
+  matches the crate version and runs the MSRV build; `.dockerignore` keeps
+  `target/` out of the test image context; `scripts/package.sh` stages
+  assets under the repository `target/` regardless of `CARGO_TARGET_DIR`.
 - The last unverified claim from the audit review now has a test: the
   smoke suite swaps in a failing `getfacl` and asserts the mutation is
   refused, distinct from the "getfacl not installed" case, which is not an

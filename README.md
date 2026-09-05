@@ -109,7 +109,7 @@ cargo install --path .
 | **Dynamic (glibc)** | >= 2.39 | 4.18 | Debian 13+, Ubuntu 24.04+, Fedora 42+, RHEL 10+ |
 
 Additional runtime dependencies (for full functionality):
-- `acl` package (`setfacl`/`getfacl`) — needed by `janitor acl` subcommands.
+- `acl` package (`setfacl`) — needed to *write* ACLs (`janitor acl`, `seal`, and restoring a snapshot whose ACLs changed). Reading ACLs (`info`, `explain`, `who-can`, `tree`, snapshots) goes through the `system.posix_acl_*` extended attributes and needs no tooling.
 - `shadow-utils` (`groupadd`, `gpasswd`) — needed by `janitor grant` managed groups.
 - The `.deb` and `.rpm` packages declare these automatically.
 
@@ -166,7 +166,7 @@ sudo janitor grant /srv/docs/secret.txt -u alice -r
 performs all of the following, atomically:
 
 1. Snapshots current permissions of `/srv`, `/srv/docs`, and `/srv/docs/secret.txt`.
-2. Creates a managed group named `pm_tmp_<owner>_<pathhash>` (unless `-g GROUP` is given).
+2. Creates a managed group named `pm_<slug>_<hash>` (slug from the last two path components, hash of the full path; unless `-g GROUP` is given).
 3. Adds Alice to the group.
 4. Sets the group-triad of `/srv` and `/srv/docs` to exactly `--x`, so Alice can pass through but cannot `ls` them.
 5. ORs the requested bits (here just `r`) onto the target file's group triad.
@@ -185,7 +185,7 @@ single-letter equivalent.
 | Command (alias) | Purpose |
 |---|---|
 | `grant` (`g`) `PATH [-u USER\|-g GROUP] [-r] [-w] [-x] [-R]` | Hierarchical grant with auto-snapshot. |
-| `revoke` (`rv`) `PATH -u USER` | Remove user from the managed group (all-or-nothing). |
+| `revoke` (`rv`) `PATH -u USER` | Remove user from the managed group (all-or-nothing). Snapshotted like every mutation, so `undo` re-adds the membership. |
 | `restore` (`r`) `ID [--yes] [--skip-missing] [--allow-replaced]` | Full rollback of a specific backup, including the group membership a `grant` created. Refuses entries whose file type or inode changed since the snapshot; `--allow-replaced` accepts a new inode (an editor rewrite) while still refusing a type change. `--skip-missing` tolerates paths that no longer exist. |
 | `undo` (`u`) `[--yes] [--skip-missing] [--allow-replaced]` | Restore the most recent backup (one-shot revert of the last change). |
 | `tree` (`t`) `PATH [-L DEPTH] [-U USER] [-A] [-c WHEN]` | Colored permission tree. |
@@ -256,7 +256,9 @@ sudo janitor preset apply setgid-dir /srv/project --recursive
 # Paths of every world-writable file under /:
 janitor --json audit / --world-writable | jq -r '.[].path'
 
-# who-can returns an object { "read": [users], "write": [users], "exec": [users] };
+# who-can returns an object { "read": [users], "write": [users], "exec": [users],
+#   "blocked": [users listed above who cannot traverse the parent chain],
+#   "blocked_by": "the ancestor that stops most of them" (or null) };
 # `.read` prints only the list of usernames who can read the target:
 janitor --json who-can /etc/shadow | jq '.read'
 
@@ -495,6 +497,13 @@ janitor seal /your/sealed/base -B ... --allow ...  # re-seal on 0.1.7 to clear
 | `restore` / `undo` refuse entries whose inode changed | An editor rewrite (write-then-rename) trips this. Add `--allow-replaced`; the file-type check still applies. |
 | `audit` / `find-orphans` fail on unreadable subtrees | Add `--best-effort` to keep exit 0 on a partial scan. |
 | A `getfacl` failure aborts the command | Only when the filesystem supports ACLs and the read fails anyway. A missing `acl` package is still not an error. |
+| Symbolic `=` with no `who` matches coreutils | `umask 022; janitor chmod =rwx f` now gives `0755` (was `0777`) and `chmod = f` gives `0000` (was `0022`). Directories keep setuid/setgid unless the clause names `s`. Write `a=rwx` to ignore the umask. |
+| `revoke` writes a backup | It now runs under the global lock, respects `janitor lock`, and prints a `backup:` id; `janitor undo` re-adds the membership. |
+| Recursive mutations refuse an unreadable subtree | `chmod -R`, `chown -R`, `copy-perms -R`, `seal -R`, `grant -R`, `preset -R` and `policy apply` exit non-zero and change nothing if part of the tree could not be enumerated. Run with sufficient privileges or exclude the subtree. |
+| `policy apply` exits non-zero on a partial apply | Check the exit status in CI; the printed `backup:` id is what `undo` needs. `policy` files with unknown keys are rejected. |
+| `compare -R` fails on an unreadable subtree | Trees that were not fully read are no longer reported as identical. |
+| `grant` and `seal` refuse a symlink operand | Name the target directory instead; `copy-perms -R` on a symlink changes the link only and does not descend. |
+| ACLs are read without `getfacl` | Reading goes through the extended attributes; the `acl` package is only needed to write ACLs. |
 
 Backups written by older versions still restore: they carry no inode
 identity, so those entries fall back to the file-type check alone.
@@ -564,10 +573,10 @@ codegen-units = 1
 The test suite consists of three layers:
 
 ```sh
-# Unit tests (59 tests).
+# Unit tests (85 tests).
 cargo test --release
 
-# End-to-end smoke tests in Docker (263 assertions).
+# End-to-end smoke tests in Docker (345 assertions).
 cargo build --release
 docker build -f tests/Dockerfile -t janitor-test .
 docker run --rm janitor-test
