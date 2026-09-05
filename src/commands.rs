@@ -537,8 +537,16 @@ pub fn cmd_restore(backup_id: &str, assume_yes: bool, opts: RestoreOptions) -> R
 /// Undo the most recent backup (newest by file mtime).
 pub fn cmd_undo(assume_yes: bool, opts: RestoreOptions) -> Result<()> {
     let files = crate::backup::list_backup_files()?;
+    // A copied or renamed `.mpk` in the directory is not a backup janitor
+    // can name; skipping it beats failing every undo until it is removed.
     let latest = files
         .iter()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(crate::backup::is_valid_backup_id)
+                .unwrap_or(false)
+        })
         .max_by_key(|p| {
             std::fs::metadata(p)
                 .and_then(|m| m.modified())
@@ -868,7 +876,16 @@ pub fn cmd_history(path: &str, since: Option<&str>, as_json: bool) -> Result<()>
         .transpose()?
         .map(|d| chrono::Utc::now() - d);
     let files = crate::backup::list_backup_files()?;
-    let mut rows: Vec<crate::types::Backup> = Vec::new();
+    // Only the header of each backup is rendered; keeping the full
+    // `entries` of every matching backup alive at once could hold gigabytes
+    // for a directory with many recursive snapshots.
+    struct HistoryRow {
+        id: String,
+        timestamp: String,
+        operation: crate::types::Operation,
+        entries: usize,
+    }
+    let mut rows: Vec<HistoryRow> = Vec::new();
     for f in &files {
         let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("");
         let data: std::result::Result<crate::types::Backup, String> = match ext {
@@ -901,7 +918,12 @@ pub fn cmd_history(path: &str, since: Option<&str>, as_json: bool) -> Result<()>
                     }
                 }
             }
-            rows.push(b);
+            rows.push(HistoryRow {
+                id: b.id,
+                timestamp: b.timestamp,
+                operation: b.operation,
+                entries: b.entries.len(),
+            });
         }
     }
     rows.reverse(); // newest first
@@ -915,7 +937,7 @@ pub fn cmd_history(path: &str, since: Option<&str>, as_json: bool) -> Result<()>
                     "type": b.operation.op_type,
                     "user": b.operation.user,
                     "target": b.operation.target,
-                    "entries": b.entries.len(),
+                    "entries": b.entries,
                 })
             })
             .collect();
@@ -966,7 +988,7 @@ pub fn cmd_history(path: &str, since: Option<&str>, as_json: bool) -> Result<()>
                 paint(Style::Primary, &action),
                 paint(Style::Primary, &target),
                 paint(Style::Label, user),
-                paint(Style::Label, &b.entries.len().to_string()),
+                paint(Style::Label, &b.entries.to_string()),
                 paint(Style::BackupId, &format!("…{id_tail}")),
             ]
         })

@@ -85,6 +85,12 @@ fn validate_backup_id(bid: &str) -> Result<()> {
     Ok(())
 }
 
+/// True for ids janitor itself generated; `undo` uses it to skip files a
+/// human dropped into the backup directory.
+pub fn is_valid_backup_id(bid: &str) -> bool {
+    validate_backup_id(bid).is_ok()
+}
+
 /// Load a backup from disk by its ID.
 /// Tries MessagePack first, falls back to legacy JSON.
 pub fn load_backup(bid: &str) -> Result<Backup> {
