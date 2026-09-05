@@ -1,0 +1,5 @@
+# tests/Dockerfile copies only the release binary and the smoke test; everything
+# else (notably the multi-GB target/ tree) would just slow the build down.
+*
+!target/release/janitor
+!tests/smoke-test.sh

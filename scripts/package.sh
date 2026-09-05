@@ -17,10 +17,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
-ASSETS="$TARGET/assets"
+# Cargo.toml's packaging metadata hardcodes target/assets/..., so the assets
+# must land there even when CARGO_TARGET_DIR points the build elsewhere.
+ASSETS="$ROOT/target/assets"
 
 echo "==> cargo build --release"
-cargo build --release
+cargo build --release --locked
 
 BIN="$TARGET/release/janitor"
 if [[ ! -x $BIN ]]; then

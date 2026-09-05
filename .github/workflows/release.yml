@@ -28,9 +28,31 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --all-targets --release -- -D warnings
+        run: cargo clippy --all-targets --release --locked -- -D warnings
       - name: cargo test
-        run: cargo test --release --all-targets
+        run: cargo test --release --all-targets --locked
+      # cargo-deb and cargo-generate-rpm take the version from Cargo.toml while
+      # the tarball is named after the tag; a mismatch would ship mislabelled
+      # artifacts under one SHA256SUMS.
+      - name: Tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          CRATE_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$CRATE_VERSION" != "$TAG_VERSION" ]; then
+            echo "tag v$TAG_VERSION does not match Cargo.toml version $CRATE_VERSION" >&2
+            exit 1
+          fi
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build --release --locked
 
   smoke:
     name: docker smoke tests
@@ -41,7 +63,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: Build test image
         run: docker build -f tests/Dockerfile -t janitor-test .
       - name: Run smoke tests
@@ -49,7 +71,7 @@ jobs:
 
   build:
     name: build ${{ matrix.artifact_name }}
-    needs: [gate, smoke]
+    needs: [gate, msrv, smoke]
     # ubuntu-22.04 provides glibc 2.35, so resulting .deb / .tar.gz binaries
     # run on Debian 12 (glibc 2.36), Ubuntu 22.04+, RHEL 9+, and newer.
     runs-on: ubuntu-22.04
@@ -107,7 +129,7 @@ jobs:
       # cheap relative to the release tarball upload and keeps the
       # workflow symmetric across targets.
       - name: Build host-native binary (for packaging assets)
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Generate packaging assets (completions + man page)
         run: |
@@ -120,11 +142,11 @@ jobs:
 
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Stage binary for packaging tools
         run: |
