@@ -39,7 +39,7 @@ fn snap(p: &Path) -> Option<Snap> {
     };
     // Only non-trivial ACLs are worth recording: every file reports
     // user::/group::/other:: entries that merely echo the mode.
-    let (acl, default_acl) = if has_extended_acl(p) {
+    let (acl, default_acl) = if has_extended_acl(p) == Some(true) {
         let (a, d) = read_acl_pair(p);
         (
             a.as_deref().map(normalize_acl).unwrap_or_default(),

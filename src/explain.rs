@@ -133,7 +133,14 @@ pub fn cmd_explain(path: &str, for_user: Option<&str>) -> Result<()> {
     let path_w = path_cells
         .iter()
         .zip(chain.iter())
-        .map(|(c, p)| c.chars().count() + if has_extended_acl(p) { 5 } else { 0 })
+        .map(|(c, p)| {
+            c.chars().count()
+                + if has_extended_acl(p) == Some(true) {
+                    5
+                } else {
+                    0
+                }
+        })
         .max()
         .unwrap_or(10)
         .max(20);
@@ -182,7 +189,7 @@ pub fn cmd_explain(path: &str, for_user: Option<&str>) -> Result<()> {
             paint(Style::Group, &gid_to_name(Gid::from_raw(md.gid())))
         );
         let owner_pad = owner_visible_w.saturating_sub(owner_raw[i].chars().count());
-        let acl_hint = if has_extended_acl(p) {
+        let acl_hint = if has_extended_acl(p) == Some(true) {
             format!(" {}", paint(Style::AclMarker, "+acl"))
         } else {
             String::new()

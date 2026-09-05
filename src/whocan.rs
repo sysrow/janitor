@@ -127,7 +127,7 @@ pub fn cmd_who_can(path: &str, as_json: bool) -> Result<()> {
         paint(Style::Separator, glyphs().midot),
         render::mode_symbolic_colored(mode, is_dir, is_symlink)
     );
-    let acl_txt = if has_extended_acl(&target) {
+    let acl_txt = if has_extended_acl(&target) == Some(true) {
         paint(Style::AclMarker, "present")
     } else {
         paint(Style::Label, "none")

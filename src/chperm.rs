@@ -617,7 +617,7 @@ pub fn cmd_copy_perms(
     let src_gid = src_md.gid();
     let src_user = uid_to_name(Uid::from_raw(src_uid));
     let src_group = gid_to_name(Gid::from_raw(src_gid));
-    let src_has_acl = crate::acl::has_extended_acl(&src_path);
+    let src_has_acl = crate::acl::has_extended_acl(&src_path) == Some(true);
 
     let stdout_tty = is_terminal::is_terminal(std::io::stdout());
 

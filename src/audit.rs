@@ -1,7 +1,7 @@
 //! `audit`: scan a directory tree and list files matching criteria.
 
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use nix::unistd::{Gid, Uid};
@@ -16,7 +16,10 @@ use crate::users::{gid_exists, gid_to_name, uid_exists, uid_to_name};
 
 #[derive(Debug, Serialize)]
 pub struct AuditHit {
-    pub path: String,
+    /// Kept as a path so `--print0` can emit the exact bytes; JSON is UTF-8
+    /// by definition and gets the lossy rendering.
+    #[serde(serialize_with = "ser_path_lossy")]
+    pub path: PathBuf,
     pub mode: String,
     pub uid: u32,
     pub user: String,
@@ -24,6 +27,10 @@ pub struct AuditHit {
     pub group: String,
     pub has_acl: bool,
     pub size: u64,
+}
+
+fn ser_path_lossy<S: serde::Serializer>(p: &Path, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(&p.to_string_lossy())
 }
 
 pub struct AuditFilter<'a> {
@@ -221,24 +228,28 @@ pub fn scan(
         if filter.no_group && gid_exists(Gid::from_raw(gid)) {
             continue;
         }
-        // ACL probe is a per-file `lgetxattr` syscall — cheap but on
-        // large trees it dominates wall time. Skip unless the caller
-        // actually needs the ACL bit (audit table column, or
-        // `filter.has_acl`). Pipe-pure `find` leaves `probe_acl=false`.
-        let acl = if filter.has_acl {
-            let v = has_extended_acl(p);
-            if !v {
-                continue;
+        // ACL probe is a per-file `lgetxattr` syscall — cheap, but on
+        // large trees it still shows up. Skip unless the caller actually
+        // needs the ACL bit (audit table column, or `filter.has_acl`).
+        // Pipe-pure `find` leaves `probe_acl=false`. An unreadable ACL is
+        // an unknown, and a scan for ACLs must not report unknown as "none".
+        let acl = if filter.has_acl || probe_acl {
+            match has_extended_acl(p) {
+                Some(v) => v,
+                None => {
+                    unreadable.push(format!("{}: ACL unreadable", p.display()));
+                    continue;
+                }
             }
-            true
-        } else if probe_acl {
-            has_extended_acl(p)
         } else {
             false
         };
+        if filter.has_acl && !acl {
+            continue;
+        }
 
         hits.push(AuditHit {
-            path: p.display().to_string(),
+            path: p.to_path_buf(),
             mode: format!("{:04o}", mode),
             uid,
             user: uid_to_name(Uid::from_raw(uid)),
@@ -302,11 +313,14 @@ pub fn cmd_audit(
     // with `janitor chmod --stdin0`, `xargs`, etc.
     if paths_only || print0 {
         use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         let sep: u8 = if print0 { 0 } else { b'\n' };
         for h in hits {
-            let _ = out.write_all(h.path.as_bytes());
+            // Raw bytes: this output exists to be piped into `--stdin0`,
+            // and a name that is not UTF-8 must come out as the name.
+            let _ = out.write_all(h.path.as_os_str().as_bytes());
             let _ = out.write_all(&[sep]);
         }
         return incomplete_result(incomplete);
@@ -400,7 +414,7 @@ pub fn cmd_audit(
             paint(Style::Group, &h.group),
             acl_cell,
             paint(Style::Label, &render::format_size(h.size)),
-            paint(Style::Primary, &h.path),
+            paint(Style::Primary, &h.path.display().to_string()),
             flags.join(" "),
         ]);
     }
@@ -459,7 +473,21 @@ pub fn cmd_audit_fix(
         println!("(no matches; nothing to fix)");
         return Ok(());
     }
-    let paths: Vec<String> = hits.iter().map(|h| h.path.clone()).collect();
+    // The mutation commands take UTF-8 operands. Refuse up front rather than
+    // hand them a lossy name that resolves to nothing (or to something else).
+    let mut paths: Vec<String> = Vec::with_capacity(hits.len());
+    for h in hits {
+        match h.path.clone().into_os_string().into_string() {
+            Ok(p) => paths.push(p),
+            Err(os) => {
+                return Err(crate::errors::PmError::Other(format!(
+                    "audit --fix: {} is not valid UTF-8; nothing was changed (fix that path \
+                     by hand)",
+                    os.to_string_lossy()
+                )))
+            }
+        }
+    }
     println!("audit --fix: {} path(s) → {action}", paths.len());
     let empty = ExcludeSet::default();
     let parts: Vec<&str> = action.splitn(2, ' ').collect();
@@ -552,13 +580,13 @@ pub fn cmd_find_orphans(
         };
         hits.push((
             AuditHit {
-                path: p.display().to_string(),
+                path: p.to_path_buf(),
                 mode: format!("{:04o}", md.mode() & 0o7777),
                 uid,
                 user: uid_to_name(Uid::from_raw(uid)),
                 gid,
                 group: gid_to_name(Gid::from_raw(gid)),
-                has_acl: has_extended_acl(p),
+                has_acl: has_extended_acl(p) == Some(true),
                 size: md.len(),
             },
             kind,
@@ -614,7 +642,7 @@ pub fn cmd_find_orphans(
             paint(Style::Danger, &h.group),
             paint(Style::Danger, &format!("[{kind}]")),
             paint(Style::Label, &render::format_size(h.size)),
-            paint(Style::Primary, &h.path),
+            paint(Style::Primary, &h.path.display().to_string()),
         ]);
     }
     println!("{}", aligned_table(header, &rows));

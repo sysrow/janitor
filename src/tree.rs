@@ -328,7 +328,7 @@ fn print_line(
     if mode & 0o002 != 0 && !is_symlink && !(is_dir && mode & 0o1000 != 0) {
         counts.world_write += 1;
     }
-    let acl_here = has_extended_acl(path);
+    let acl_here = has_extended_acl(path) == Some(true);
     if acl_here {
         counts.acl += 1;
     }

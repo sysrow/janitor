@@ -3,15 +3,19 @@
 //! Answers the question "what can user U actually do to this inode?" by
 //! consulting the POSIX mode bits **and** any POSIX ACL entries + mask.
 //!
-//! We intentionally shell out to `getfacl -cn` (via `acl::get_acl`) and
-//! parse the canonical entries rather than binding to `libacl`. It keeps
-//! the dep surface minimal and matches how the rest of this crate
-//! reads/writes ACLs.
+//! The check is split into the two things it depends on: [`UserCtx`] (uid
+//! and group set, resolved once per user) and [`InodeFacts`] (mode, owner
+//! and ACL text, read once per path). [`evaluate`] combines them without
+//! touching the filesystem, so `who-can` can ask about thousands of users
+//! and `tree -U` about thousands of paths without repeating NSS lookups or
+//! ACL reads for every pair.
 
 use std::collections::HashSet;
+use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
-use crate::acl::{get_acl, has_extended_acl};
+use crate::acl::{get_acl, is_extended_text};
 use crate::errors::Result;
 use crate::users::{lookup_user, user_gids};
 
@@ -26,7 +30,91 @@ pub struct AccessDecision {
     pub reason: String,
 }
 
-/// Evaluate effective (r, w, x) for `username` on `path`.
+/// The identity side of an access check, resolved once per user.
+#[derive(Debug, Clone)]
+pub struct UserCtx {
+    pub name: String,
+    pub uid: u32,
+    /// Primary plus supplementary group ids.
+    pub gids: HashSet<u32>,
+}
+
+impl UserCtx {
+    pub fn resolve(username: &str) -> Result<UserCtx> {
+        let u = lookup_user(username)?;
+        let gids = user_gids(username)?
+            .into_iter()
+            .map(|g| g.as_raw())
+            .collect();
+        Ok(UserCtx {
+            name: username.to_string(),
+            uid: u.uid.as_raw(),
+            gids,
+        })
+    }
+}
+
+/// The inode side of an access check, read once per path.
+#[derive(Debug, Clone)]
+pub struct InodeFacts {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub is_dir: bool,
+    /// Access ACL in `getfacl -c` form. `None` only for a symlink whose
+    /// target could not be read through.
+    pub acl: Option<String>,
+    /// The path was a symlink and these facts describe its target.
+    pub via_symlink: bool,
+    /// The path is a symlink whose target cannot be resolved.
+    pub unresolvable: bool,
+}
+
+impl InodeFacts {
+    /// Facts about `path`, or, for a symlink, about its target.
+    ///
+    /// A symlink's own mode is always 0777 and the kernel never consults it:
+    /// what a user can do *through* the link is decided by the target. The
+    /// old evaluator looked at the link inode, so `info -U` and `tree -U`
+    /// reported `rwx` for every symlink, whatever it pointed at.
+    ///
+    /// Fail-closed on the ACL: an attribute that exists but cannot be read
+    /// is an error, not "no ACL". The group triad of an ACL-bearing file is
+    /// the mask, so a mode-bits-only answer is wrong in both directions.
+    pub fn read(path: &Path) -> Result<InodeFacts> {
+        let lmd = fs::symlink_metadata(path)?;
+        if lmd.file_type().is_symlink() {
+            return match fs::canonicalize(path) {
+                Ok(target) => {
+                    let mut facts = InodeFacts::read(&target)?;
+                    facts.via_symlink = true;
+                    Ok(facts)
+                }
+                Err(_) => Ok(InodeFacts {
+                    mode: 0,
+                    uid: lmd.uid(),
+                    gid: lmd.gid(),
+                    is_dir: false,
+                    acl: None,
+                    via_symlink: true,
+                    unresolvable: true,
+                }),
+            };
+        }
+        let acl = get_acl(path)?;
+        Ok(InodeFacts {
+            mode: lmd.mode() & 0o7777,
+            uid: lmd.uid(),
+            gid: lmd.gid(),
+            is_dir: lmd.is_dir(),
+            acl,
+            via_symlink: false,
+            unresolvable: false,
+        })
+    }
+}
+
+/// Evaluate effective (r, w, x) for `user` on an inode. Pure.
 ///
 /// The algorithm follows POSIX.1e §23.4.5:
 /// 1. Superuser (uid 0) gets r+w. Execute only if any `x` bit is set, or
@@ -43,63 +131,73 @@ pub struct AccessDecision {
 ///
 /// If the file has no extended ACL, steps 3-5 collapse to the standard
 /// group/other triads (no mask, since no mask entry exists).
-///
-/// Takes a path rather than `Metadata` on purpose: `Metadata` does not
-/// carry the originating path, and without it the ACL entries above cannot
-/// be read at all.
-pub fn effective_for_user_path(path: &std::path::Path, username: &str) -> Result<AccessDecision> {
-    let md = std::fs::symlink_metadata(path)?;
-    let u = lookup_user(username)?;
-    let uid = u.uid.as_raw();
-    let gids: HashSet<u32> = user_gids(username)?
-        .into_iter()
-        .map(|g| g.as_raw())
-        .collect();
+pub fn evaluate(facts: &InodeFacts, user: &UserCtx) -> AccessDecision {
+    let mut d = evaluate_inner(facts, user);
+    if facts.via_symlink && !facts.unresolvable {
+        d.reason.push_str(" (via symlink target)");
+    }
+    d
+}
 
-    let mode = md.mode() & 0o7777;
-    let is_dir = md.is_dir();
-
-    if uid == 0 {
-        return Ok(AccessDecision {
+fn evaluate_inner(facts: &InodeFacts, user: &UserCtx) -> AccessDecision {
+    if facts.unresolvable {
+        return AccessDecision {
+            read: false,
+            write: false,
+            exec: false,
+            reason: "unresolvable symlink".into(),
+        };
+    }
+    let mode = facts.mode;
+    if user.uid == 0 {
+        return AccessDecision {
             read: true,
             write: true,
-            exec: is_dir || (mode & 0o111 != 0),
+            exec: facts.is_dir || (mode & 0o111 != 0),
             reason: "root (superuser)".into(),
-        });
+        };
     }
-    if uid == md.uid() {
-        return Ok(AccessDecision {
+    if user.uid == facts.uid {
+        return AccessDecision {
             read: mode & 0o400 != 0,
             write: mode & 0o200 != 0,
             exec: mode & 0o100 != 0,
             reason: "owner".into(),
-        });
+        };
     }
 
-    if has_extended_acl(path) {
-        if let Ok(Some(text)) = get_acl(path) {
-            if let Some(d) = evaluate_acl(&text, uid, &gids, md.gid(), username) {
-                return Ok(d);
+    if let Some(text) = &facts.acl {
+        if is_extended_text(text) {
+            if let Some(d) = evaluate_acl(text, user.uid, &user.gids, facts.gid, &user.name) {
+                return d;
             }
         }
     }
 
-    let group_match = gids.contains(&md.gid());
-    if group_match {
-        Ok(AccessDecision {
+    if user.gids.contains(&facts.gid) {
+        AccessDecision {
             read: mode & 0o040 != 0,
             write: mode & 0o020 != 0,
             exec: mode & 0o010 != 0,
             reason: "group member".into(),
-        })
+        }
     } else {
-        Ok(AccessDecision {
+        AccessDecision {
             read: mode & 0o004 != 0,
             write: mode & 0o002 != 0,
             exec: mode & 0o001 != 0,
             reason: "other".into(),
-        })
+        }
     }
+}
+
+/// Evaluate effective (r, w, x) for `username` on `path`: one user, one
+/// path. Callers that loop over users or paths should resolve a
+/// [`UserCtx`] / [`InodeFacts`] once and call [`evaluate`] instead.
+pub fn effective_for_user_path(path: &Path, username: &str) -> Result<AccessDecision> {
+    let user = UserCtx::resolve(username)?;
+    let facts = InodeFacts::read(path)?;
+    Ok(evaluate(&facts, &user))
 }
 
 /// Parse a canonical `getfacl -c` block and apply POSIX.1e evaluation
@@ -430,5 +528,107 @@ default:other::rwx
             !d.read && !d.write && !d.exec,
             "default-ACL must not grant access on the entry itself"
         );
+    }
+
+    // ── evaluate(): pure decision table ───────────────────────────────
+
+    fn facts(mode: u32, uid: u32, gid: u32, is_dir: bool, acl: Option<&str>) -> InodeFacts {
+        InodeFacts {
+            mode,
+            uid,
+            gid,
+            is_dir,
+            acl: acl.map(str::to_string),
+            via_symlink: false,
+            unresolvable: false,
+        }
+    }
+
+    fn user(uid: u32, gids: &[u32]) -> UserCtx {
+        UserCtx {
+            name: format!("u{uid}"),
+            uid,
+            gids: gids.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn evaluate_mode_bits_by_class() {
+        let f = facts(
+            0o640,
+            1000,
+            2000,
+            false,
+            Some("user::rw-\ngroup::r--\nother::---"),
+        );
+        let owner = evaluate(&f, &user(1000, &[1000]));
+        assert!(owner.read && owner.write && !owner.exec);
+        assert_eq!(owner.reason, "owner");
+        let member = evaluate(&f, &user(1001, &[2000]));
+        assert!(member.read && !member.write);
+        assert_eq!(member.reason, "group member");
+        let other = evaluate(&f, &user(1002, &[1002]));
+        assert!(!other.read && !other.write && !other.exec);
+        assert_eq!(other.reason, "other");
+        let root = evaluate(&f, &user(0, &[0]));
+        assert!(
+            root.read && root.write && !root.exec,
+            "root needs an x bit to execute"
+        );
+    }
+
+    #[test]
+    fn evaluate_uses_acl_only_when_extended() {
+        let f = facts(
+            0o640,
+            1000,
+            2000,
+            false,
+            Some("user::rw-\nuser:u1002:r--\ngroup::r--\nmask::r--\nother::---"),
+        );
+        let named = evaluate(&f, &user(1002, &[1002]));
+        assert!(named.read && !named.write);
+        assert!(named.reason.starts_with("acl user:"), "{}", named.reason);
+    }
+
+    #[test]
+    fn unresolvable_symlink_grants_nothing() {
+        let mut f = facts(0o777, 1000, 1000, false, None);
+        f.via_symlink = true;
+        f.unresolvable = true;
+        let d = evaluate(&f, &user(1000, &[1000]));
+        assert!(!d.read && !d.write && !d.exec);
+        assert_eq!(d.reason, "unresolvable symlink");
+    }
+
+    #[test]
+    fn symlink_facts_describe_the_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("janitor-access-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("l");
+        std::os::unix::fs::symlink(&f, &link).unwrap();
+        let facts = InodeFacts::read(&link).unwrap();
+        assert!(facts.via_symlink);
+        assert_eq!(
+            facts.mode, 0o600,
+            "the link's own 0777 must not leak through"
+        );
+        let me = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+            .unwrap();
+        let d = evaluate(&facts, &UserCtx::resolve(&me).unwrap());
+        assert!(d.read && d.write && !d.exec, "{d:?}");
+        assert!(d.reason.ends_with("(via symlink target)"), "{}", d.reason);
+        std::fs::remove_file(&f).unwrap();
+        let dangling = InodeFacts::read(&link).unwrap();
+        assert!(dangling.unresolvable);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

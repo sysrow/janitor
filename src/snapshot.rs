@@ -5,7 +5,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::acl::{acl_available, get_acl, get_default_acl, supports_acl};
+use crate::acl::{acl_available, get_acl, get_default_acl, is_extended_text, supports_acl};
 use crate::errors::{PmError, Result};
 use crate::types::SnapEntry;
 
@@ -62,11 +62,10 @@ pub fn snapshot_with_acl(paths: &[impl AsRef<Path>], capture_acl: bool) -> Resul
 
 /// Read the access and default ACL of `p`, or report that ACLs are not
 /// obtainable here. Returns `(acl, default_acl, unavailable)`.
+///
+/// Reading goes through the ACL extended attributes and needs no tooling;
+/// only a filesystem without ACL support leaves the entry uncaptured.
 fn capture_acls(p: &Path, is_dir: bool) -> Result<(Option<String>, Option<String>, bool)> {
-    if !acl_available() {
-        warn_acl_tooling_missing();
-        return Ok((None, None, true));
-    }
     if !supports_acl(p) {
         // The filesystem cannot hold ACLs, so there is nothing to lose.
         return Ok((None, None, true));
@@ -83,6 +82,10 @@ fn capture_acls(p: &Path, is_dir: bool) -> Result<(Option<String>, Option<String
     } else {
         None
     };
+    let extended = acl.as_deref().map(is_extended_text).unwrap_or(false) || default_acl.is_some();
+    if extended && !acl_available() {
+        warn_acl_tooling_missing();
+    }
     Ok((acl, default_acl, false))
 }
 
@@ -92,8 +95,8 @@ fn warn_acl_tooling_missing() {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
         eprintln!(
-            "warning: getfacl/setfacl not installed; ACLs are not captured in this backup \
-             (install the `acl` package)"
+            "warning: setfacl not installed; ACLs are captured in this backup but cannot be \
+             restored until the `acl` package is installed"
         );
     }
 }
