@@ -7,7 +7,7 @@
 //! transaction with one snapshot, and auto-propagates the traversal bit
 //! through the parent chain.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::acl::{acl_modify, supports_acl};
@@ -146,7 +146,18 @@ pub fn cmd_seal(
 ) -> Result<()> {
     let base_path = resolve_path_nofollow(base)?;
     crate::locks::ensure_not_locked(&base_path)?;
-    if !base_path.is_dir() {
+    let base_md = std::fs::symlink_metadata(&base_path)
+        .map_err(|e| PmError::Other(format!("stat {}: {e}", base_path.display())))?;
+    if base_md.file_type().is_symlink() {
+        // `is_dir()` follows the link and walkdir descends through a root
+        // symlink by default, so a linked base used to seal a whole foreign
+        // tree through the link.
+        return Err(PmError::Other(format!(
+            "seal base {} is a symlink; seal the directory it points to instead",
+            base_path.display()
+        )));
+    }
+    if !base_md.is_dir() {
         return Err(PmError::SealBaseNotDir(base_path));
     }
 
@@ -195,10 +206,11 @@ pub fn cmd_seal(
     if recursive {
         for entry in walkdir::WalkDir::new(&base_path)
             .follow_links(false)
+            .follow_root_links(false)
             .into_iter()
             .filter_entry(|e| !ex.is_excluded(e.path()))
-            .filter_map(|e| e.ok())
         {
+            let entry = entry.map_err(|e| crate::chperm::walk_error(&base_path, &e))?;
             let p = entry.path();
             crate::locks::ensure_not_locked(p)?;
             baseline_paths.push(p.to_path_buf());
@@ -213,12 +225,36 @@ pub fn cmd_seal(
     // principal traversal over all of it is how a user allowed only under
     // /base/a also ended up with --x on /base/b. The union is still what the
     // snapshot has to cover; the ACL writes must stay per-pinhole.
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     let mut chains: Vec<Vec<PathBuf>> = Vec::with_capacity(pinholes.len());
     for p in &pinholes {
         chains.push(chain_from_base(&base_path, &p.path)?);
     }
     let chain_union: BTreeSet<PathBuf> = chains.iter().flatten().cloned().collect();
+
+    // Pinhole targets and their chains receive ACL writes whether or not
+    // the baseline walk visited them (no `-R`, or pruned by `--exclude`),
+    // so they get their own lock check.
+    for p in chain_union.iter().chain(pinholes.iter().map(|p| &p.path)) {
+        crate::locks::ensure_not_locked(p)?;
+    }
+
+    // One ACL entry per (principal, path). `setfacl -m` replaces the entry
+    // for a qualifier rather than merging, so a pinhole on a directory and
+    // another pinhole below it used to fight: whichever was written last
+    // won, and the directory ended up with either the explicit perms and
+    // no traverse or with `--x` and no explicit perms.
+    let mut wanted: BTreeMap<(String, PathBuf), u32> = BTreeMap::new();
+    for (p, chain) in pinholes.iter().zip(&chains) {
+        let principal = format!("{}:{}", p.kind, p.name);
+        for dir in chain {
+            if dir == &p.path {
+                continue;
+            }
+            *wanted.entry((principal.clone(), dir.clone())).or_insert(0) |= 0o1;
+        }
+        *wanted.entry((principal, p.path.clone())).or_insert(0) |= perm_bits(&p.perm);
+    }
 
     if dry_run {
         print_card(
@@ -258,29 +294,17 @@ pub fn cmd_seal(
                 parent_op: None,
                 group_created: false,
                 user_added: false,
+                user_removed: false,
             },
         )?;
 
         apply_baseline(&baseline_paths, &spec)?;
 
-        // Each principal gets traversal on its OWN ancestors only. Dedup on
-        // (principal, path) so two pinholes for the same user sharing a
-        // parent don't setfacl the same directory twice.
-        let mut applied: BTreeSet<(String, PathBuf)> = BTreeSet::new();
-        for (p, chain) in pinholes.iter().zip(&chains) {
-            let principal = format!("{}:{}", p.kind, p.name);
-            for dir in chain {
-                if dir == &p.path {
-                    continue;
-                }
-                if !applied.insert((principal.clone(), dir.clone())) {
-                    continue;
-                }
-                let s = format!("{principal}:--x");
-                acl_modify(dir, &s, false, false)?;
-            }
-            let s = format!("{principal}:{}", p.perm);
-            acl_modify(&p.path, &s, false, false)?;
+        // Each principal gets traversal on its OWN ancestors only; the
+        // union above already merged every pinhole's demand on a path.
+        for ((principal, path), bits) in &wanted {
+            let s = format!("{principal}:{}", perm_string(*bits));
+            acl_modify(path, &s, false, false)?;
         }
 
         print_card(
@@ -297,6 +321,31 @@ pub fn cmd_seal(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+/// `"rwx"`-style perm string to bits.
+fn perm_bits(perm: &str) -> u32 {
+    let mut bits = 0;
+    if perm.contains('r') {
+        bits |= 0o4;
+    }
+    if perm.contains('w') {
+        bits |= 0o2;
+    }
+    if perm.contains('x') {
+        bits |= 0o1;
+    }
+    bits
+}
+
+/// Bits to the `setfacl` perm form (`r-x`).
+fn perm_string(bits: u32) -> String {
+    format!(
+        "{}{}{}",
+        if bits & 0o4 != 0 { 'r' } else { '-' },
+        if bits & 0o2 != 0 { 'w' } else { '-' },
+        if bits & 0o1 != 0 { 'x' } else { '-' }
+    )
+}
 
 fn apply_baseline(paths: &[PathBuf], spec: &BaseSpec) -> Result<()> {
     use nix::unistd::{Gid, Uid};
@@ -323,7 +372,9 @@ fn apply_baseline(paths: &[PathBuf], spec: &BaseSpec) -> Result<()> {
         None => None,
     };
 
-    for p in paths {
+    // Deepest paths first: a baseline without owner-x applied to a directory
+    // before its children would lock the run out of its own subtree.
+    for p in &crate::chperm::depth_first(paths) {
         let md = std::fs::symlink_metadata(p)?;
         if md.file_type().is_symlink() {
             // Symlinks: lchown only (never follow), skip chmod.
@@ -359,28 +410,12 @@ fn apply_baseline(paths: &[PathBuf], spec: &BaseSpec) -> Result<()> {
                 )));
             }
         }
-        let mut mode = spec.mode;
         // Traditional "X" semantics: if spec mode has no x bits and
         // target is a directory, we still apply as-is (user asked
-        // explicitly for that mode). No magic.
-        let _ = md;
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
+        // explicitly for that mode). No magic. The inode read above is
+        // pinned so a swap after the check cannot redirect the chmod.
+        crate::perms::chmod_nofollow(p, spec.mode, Some((md.dev(), md.ino())))
             .map_err(|e| PmError::Other(format!("chmod {}: {e}", p.display())))?;
-        // Rust's set_permissions clears high bits above 0o777 on some
-        // versions; re-chmod raw for setuid/setgid/sticky.
-        if mode & 0o7000 != 0 {
-            let cstr = std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
-                .map_err(|_| PmError::Other(format!("bad path: {}", p.display())))?;
-            let rc = unsafe { libc::chmod(cstr.as_ptr(), mode as libc::mode_t) };
-            if rc != 0 {
-                return Err(PmError::Other(format!(
-                    "chmod special-bits on {} failed",
-                    p.display()
-                )));
-            }
-            mode |= 0; // silence unused
-        }
-        let _ = mode;
     }
     Ok(())
 }

@@ -44,10 +44,14 @@ pub fn expand_targets(
             for entry in walkdir::WalkDir::new(&t)
                 .min_depth(1)
                 .follow_links(false)
+                .follow_root_links(false)
                 .into_iter()
                 .filter_entry(|e| !exclude.is_excluded(e.path()))
-                .filter_map(|e| e.ok())
             {
+                // A subtree that cannot be enumerated cannot be backed up,
+                // so it cannot be mutated either. Dropping the error here
+                // used to turn a partial walk into a "successful" run.
+                let entry = entry.map_err(|e| walk_error(&t, &e))?;
                 let ep = entry.into_path();
                 crate::locks::ensure_not_locked(&ep)?;
                 paths.push(ep);
@@ -55,6 +59,18 @@ pub fn expand_targets(
         }
     }
     Ok((resolved_targets, paths))
+}
+
+/// Describe a `walkdir` failure as the refusal it is.
+pub(crate) fn walk_error(root: &Path, e: &walkdir::Error) -> PmError {
+    let at = e
+        .path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| root.display().to_string());
+    PmError::Other(format!(
+        "cannot walk {at}: {e}\n       refusing to mutate a tree that could not be fully \
+         enumerated (nothing was changed)"
+    ))
 }
 
 /// Order paths deepest-first so children are chmod'ed before their parents.
@@ -67,7 +83,7 @@ pub fn expand_targets(
 ///
 /// The walk itself already happened in `expand_targets`, so reordering here
 /// cannot affect which paths are visited.
-fn depth_first(paths: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn depth_first(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = paths.to_vec();
     out.sort_by_key(|b| std::cmp::Reverse(b.components().count()));
     out
@@ -435,6 +451,7 @@ pub fn cmd_chmod(
                     parent_op: None,
                     group_created: false,
                     user_added: false,
+                    user_removed: false,
                 },
             )?;
             println!("backup: {bid}");
@@ -511,6 +528,7 @@ pub fn cmd_chown(
                     parent_op: None,
                     group_created: false,
                     user_added: false,
+                    user_removed: false,
                 },
             )?;
             println!("backup: {bid}");
@@ -685,6 +703,7 @@ pub fn cmd_copy_perms(
                     parent_op: None,
                     group_created: false,
                     user_added: false,
+                    user_removed: false,
                 },
             )?;
             backup_id = Some(bid);

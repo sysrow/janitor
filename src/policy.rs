@@ -157,6 +157,7 @@ pub fn cmd_policy_apply(file: &str, dry_run: bool) -> Result<()> {
                     parent_op: None,
                     group_created: false,
                     user_added: false,
+                    user_removed: false,
                 },
             )?;
             println!("backup: {bid}");

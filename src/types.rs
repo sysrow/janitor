@@ -100,6 +100,10 @@ pub struct Operation {
     /// The operation added `user` to `group`; restore removes the membership.
     #[serde(default)]
     pub user_added: bool,
+    /// The operation removed `user` from `group` (`revoke`); restore adds
+    /// the membership back.
+    #[serde(default)]
+    pub user_removed: bool,
 }
 
 /// Complete backup payload stored as JSON.

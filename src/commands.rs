@@ -39,6 +39,22 @@ pub fn cmd_grant(
 
     let target = resolve_path_nofollow(path)?;
     crate::locks::ensure_not_locked(&target)?;
+    // A symlink's own mode is never consulted by the kernel, so there is
+    // nothing a grant on it could hand out; it used to create the group,
+    // print "chgrp ... chmod ..." and change nothing, or with -R walk
+    // through the link into a tree the operand never named.
+    if let Ok(md) = std::fs::symlink_metadata(&target) {
+        if md.file_type().is_symlink() {
+            let dest = std::fs::read_link(&target)
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|_| "?".into());
+            return Err(PmError::Other(format!(
+                "refusing to grant on a symlink: {} -> {dest}\n       grant on the target \
+                 path instead",
+                target.display()
+            )));
+        }
+    }
     let access_bits = parse_access(access)?;
 
     // Decide managed group.
@@ -172,11 +188,20 @@ pub fn cmd_grant(
     // Build full touched set: parents + target + recursive descendants.
     let mut touched: Vec<PathBuf> = filtered_parents.clone();
     touched.push(chain.last().unwrap().clone());
-    let extra: Vec<PathBuf> = if recursive && target.is_dir() {
-        collect_recursive(&target, &ex)
+    let target_is_dir = std::fs::symlink_metadata(&target)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    let extra: Vec<PathBuf> = if recursive && target_is_dir {
+        collect_recursive(&target, &ex)?
     } else {
         Vec::new()
     };
+    // A lock on a descendant is not an ancestor of the operand, so the
+    // check above cannot see it; every other recursive mutator checks each
+    // expanded path, and `grant -R` walked straight over locked children.
+    for p in &extra {
+        crate::locks::ensure_not_locked(p)?;
+    }
     let mut all_paths = touched.clone();
     all_paths.extend(extra.iter().cloned());
 
@@ -187,6 +212,12 @@ pub fn cmd_grant(
         let mut backup_id: Option<String> = None;
         if !dry_run {
             let snap = snapshot_with_acl(&all_paths, capture_acl)?;
+            // Probe the account database under the lock, not before it: two
+            // concurrent grants on one path would otherwise both record
+            // `group_created`, and restoring either would delete a group
+            // the other still relies on.
+            let group_existed = group_exists(&group_name);
+            let user_in = user.map(|u| user_in_group(u, &group_name)).unwrap_or(true);
             let op = Operation {
                 op_type: "grant".into(),
                 user: user.map(String::from),
@@ -199,6 +230,7 @@ pub fn cmd_grant(
                 parent_op: None,
                 group_created: !group_existed,
                 user_added: !user_in,
+                user_removed: false,
             };
             backup_id = Some(save_backup(snap, op)?);
 
@@ -389,37 +421,88 @@ fn narrate_action(tty: bool, dry_run: bool, already_ok: bool, verb: &str, subjec
 
 /// Collect all entries under a directory (excluding root itself).
 /// Excluded directories are pruned: their children are never visited.
-fn collect_recursive(target: &Path, exclude: &crate::matcher::ExcludeSet) -> Vec<PathBuf> {
-    walkdir::WalkDir::new(target)
+/// Fail-closed: a subtree that cannot be enumerated cannot be backed up.
+fn collect_recursive(target: &Path, exclude: &crate::matcher::ExcludeSet) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in walkdir::WalkDir::new(target)
         .min_depth(1)
         .follow_links(false)
+        .follow_root_links(false)
         .into_iter()
         .filter_entry(|e| !exclude.is_excluded(e.path()))
-        .filter_map(|e| e.ok())
-        .map(|e| e.into_path())
-        .collect()
+    {
+        let entry = entry.map_err(|e| crate::chperm::walk_error(target, &e))?;
+        out.push(entry.into_path());
+    }
+    Ok(out)
 }
 
+/// Remove a user from the managed group of a path.
+///
+/// An account change is a mutation like any other: it runs under the
+/// global lock, respects path locks, and writes a backup that records the
+/// removal so `undo` can add the membership back. It used to call
+/// `gpasswd -d` directly, which left no way back: restoring the original
+/// grant's backup *removes* the membership again.
 pub fn cmd_revoke(user: &str, path: &str, group: Option<&str>, dry_run: bool) -> Result<()> {
     let target = resolve_path_nofollow(path)?;
+    crate::locks::ensure_not_locked(&target)?;
+    lookup_user(user)?;
     let group_name = match group {
         Some(g) => g.to_string(),
         None => default_group_name(&target),
     };
-    let changed = remove_user_from_group(user, &group_name, dry_run)?;
-    if changed && !dry_run {
+    with_lock(|| {
+        if !group_exists(&group_name) {
+            eprintln!("group {group_name:?} does not exist; nothing to remove");
+            return Ok(());
+        }
+        if !user_in_group(user, &group_name) {
+            eprintln!("user {user:?} is not in {group_name:?}; nothing to remove");
+            return Ok(());
+        }
+        if dry_run {
+            println!("[dry-run] gpasswd -d {user} {group_name}");
+            return Ok(());
+        }
+        let snap = snapshot_with_acl(std::slice::from_ref(&target), true)?;
+        let bid = save_backup(
+            snap,
+            Operation {
+                op_type: "revoke".into(),
+                user: Some(user.to_string()),
+                group: Some(group_name.clone()),
+                explicit_group: group.map(String::from),
+                target: Some(target.display().to_string()),
+                access: None,
+                max_level: None,
+                recursive: None,
+                parent_op: None,
+                group_created: false,
+                user_added: false,
+                user_removed: true,
+            },
+        )?;
+        remove_user_from_group(user, &group_name, false)?;
+        println!("backup: {bid}");
         println!("removed {user} from {group_name}");
-        println!("note: file mode/ownership unchanged; use `restore <id>` for full revert.");
-    }
-    Ok(())
+        println!(
+            "note: file mode/ownership unchanged; `janitor undo` re-adds the membership, \
+             `restore <grant id>` reverts the grant itself."
+        );
+        Ok(())
+    })
 }
 
 pub fn cmd_backup(path: &str, recursive: bool, capture_acl: bool) -> Result<()> {
     let target = resolve_path_nofollow(path)?;
     let mut paths = vec![target.clone()];
-    if recursive && target.is_dir() {
+    let target_is_dir = std::fs::symlink_metadata(&target)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if recursive && target_is_dir {
         let empty = crate::matcher::ExcludeSet::new(&[])?;
-        paths.extend(collect_recursive(&target, &empty));
+        paths.extend(collect_recursive(&target, &empty)?);
     }
     with_lock(|| {
         let snap = snapshot_with_acl(&paths, capture_acl)?;
@@ -438,6 +521,7 @@ pub fn cmd_backup(path: &str, recursive: bool, capture_acl: bool) -> Result<()> 
                 parent_op: None,
                 group_created: false,
                 user_added: false,
+                user_removed: false,
             },
         )?;
         println!("backup: {bid}  ({count} entries)");
@@ -639,9 +723,21 @@ fn restore_with_preview(
 fn revert_account_changes(op: &crate::types::Operation, dry_run: bool) -> u32 {
     let mut errors = 0u32;
     let group = match &op.group {
-        Some(g) if op.user_added || op.group_created => g,
+        Some(g) if op.user_added || op.group_created || op.user_removed => g,
         _ => return 0,
     };
+    if op.user_removed {
+        if let Some(u) = &op.user {
+            if dry_run {
+                println!("[dry-run] gpasswd -a {u} {group}");
+            } else if let Err(e) = add_user_to_group(u, group, false) {
+                eprintln!("error re-adding {u} to {group}: {e}");
+                errors += 1;
+            } else {
+                println!("re-added {u} to {group}");
+            }
+        }
+    }
     if op.user_added {
         if let Some(u) = &op.user {
             if dry_run {

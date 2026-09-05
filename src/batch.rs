@@ -179,6 +179,7 @@ pub fn cmd_batch(file: &str, dry_run: bool) -> Result<()> {
                     parent_op: None,
                     group_created: false,
                     user_added: false,
+                    user_removed: false,
                 },
             )?;
             println!("backup: {bid}");

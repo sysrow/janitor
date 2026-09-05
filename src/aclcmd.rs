@@ -100,6 +100,7 @@ pub fn cmd_acl_grant(
                     parent_op: None,
                     group_created: false,
                     user_added: false,
+                    user_removed: false,
                 },
             )?;
             println!("backup: {bid}");
@@ -149,6 +150,7 @@ pub fn cmd_acl_revoke(
                     parent_op: None,
                     group_created: false,
                     user_added: false,
+                    user_removed: false,
                 },
             )?;
             println!("backup: {bid}");
@@ -186,6 +188,7 @@ pub fn cmd_acl_strip(path: &str, recursive: bool, dry_run: bool) -> Result<()> {
                     parent_op: None,
                     group_created: false,
                     user_added: false,
+                    user_removed: false,
                 },
             )?;
             println!("backup: {bid}");
