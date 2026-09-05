@@ -21,7 +21,7 @@ use crate::chperm::{
     apply_chmod_to_paths, apply_chown_to_paths, expand_targets, parse_octal, resolve_chown_target,
 };
 use crate::errors::{PmError, Result};
-use crate::helpers::resolve_path;
+use crate::helpers::resolve_path_nofollow;
 use crate::locking::with_lock;
 use crate::matcher::ExcludeSet;
 use crate::presets::resolve_preset;
@@ -33,12 +33,16 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
+// Unknown keys are errors: a typo such as `recursve: true` silently applied
+// a narrower rule than the file's author intended.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Policy {
     rules: Vec<Rule>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Rule {
     path: String,
     #[serde(default)]
@@ -169,18 +173,32 @@ pub fn cmd_policy_apply(file: &str, dry_run: bool) -> Result<()> {
         // policy that had just been applied successfully.
         for pl in &plans {
             if let Some((u, g)) = pl.chown {
-                apply_chown_to_paths(&pl.paths, u, g, dry_run)
-                    .map(|_| ())
+                let counts = apply_chown_to_paths(&pl.paths, u, g, dry_run)
                     .map_err(|e| PmError::Other(format!("policy rule {:?}: {e}", pl.rule.path)))?;
+                no_failures(&pl.rule.path, counts)?;
             }
             if let Some(m) = &pl.mode {
-                apply_chmod_to_paths(&pl.paths, m, None, dry_run)
-                    .map(|_| ())
+                let counts = apply_chmod_to_paths(&pl.paths, m, None, dry_run)
                     .map_err(|e| PmError::Other(format!("policy rule {:?}: {e}", pl.rule.path)))?;
+                no_failures(&pl.rule.path, counts)?;
             }
         }
         Ok(())
     })
+}
+
+/// The `apply_*_to_paths` helpers report per-path failures in their count
+/// tuple and keep going, which suits a standalone `chmod`. A policy run
+/// that left paths unchanged must not exit 0: the backup printed above is
+/// what `janitor undo` needs to take the partial result back.
+fn no_failures(rule: &str, (changed, _unchanged, failed): (usize, usize, usize)) -> Result<()> {
+    if failed > 0 {
+        return Err(PmError::Other(format!(
+            "policy rule {rule:?}: {failed} path(s) failed ({changed} applied before the \
+             failure; revert with `janitor undo`)"
+        )));
+    }
+    Ok(())
 }
 
 pub fn cmd_policy_verify(file: &str) -> Result<()> {
@@ -198,7 +216,9 @@ pub fn cmd_policy_verify(file: &str) -> Result<()> {
 }
 
 fn verify_rule(r: &Rule) -> Result<usize> {
-    let target = resolve_path(&r.path)?;
+    // Same resolution as apply: a symlinked `path:` is checked as the link
+    // apply would operate on, not as the target apply never touches.
+    let target = resolve_path_nofollow(&r.path)?;
     let ex = ExcludeSet::new(&r.exclude)?;
     // Same resolution apply uses, so verify can never bless a rule apply
     // would refuse, and a missing user/group is an error rather than a
@@ -258,14 +278,36 @@ fn verify_rule(r: &Rule) -> Result<usize> {
         }
     };
     check(&target);
-    if r.recursive && target.is_dir() {
+    let is_dir = fs::symlink_metadata(&target)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if r.recursive && is_dir {
+        // `filter_entry` prunes an excluded directory together with its
+        // subtree, exactly as `expand_targets` does for apply. Checking the
+        // children of a pruned directory reported drift that no apply could
+        // ever clear.
+        let mut unreadable = 0usize;
         for e in walkdir::WalkDir::new(&target)
             .follow_links(false)
+            .follow_root_links(false)
             .min_depth(1)
             .into_iter()
-            .filter_map(|e| e.ok())
+            .filter_entry(|e| !ex.is_excluded(e.path()))
         {
-            check(e.path());
+            match e {
+                Ok(e) => check(e.path()),
+                Err(err) => {
+                    println!("unreadable: {err}");
+                    unreadable += 1;
+                }
+            }
+        }
+        if unreadable > 0 {
+            return Err(PmError::Other(format!(
+                "policy rule {:?}: {unreadable} path(s) could not be read; a verify that \
+                 cannot see the tree cannot pass it",
+                r.path
+            )));
         }
     }
     Ok(drift)
